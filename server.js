@@ -5,6 +5,7 @@ require('dotenv').config();
 const path= require('path');
 const app = express();
 const port = process.env.PORT || 3001;
+const mqtt = require('mqtt');
 const mimeTypes = require('mime-types');
 // Middleware
 app.use(cors());
@@ -28,6 +29,49 @@ pool.on('error', (err) => {
   console.error('Unexpected error on idle client', err);
   process.exit(-1);
 });
+
+
+
+
+// ---------------- MQTT Reset ---------------- //
+
+
+// ---------------- MQTT Status Display ---------------- //
+
+const mqttClient = mqtt.connect("mqtt://ekco-tracking.co.za:1883", {
+    username: "dev:ekcoFleets",
+    password: "dzRND6ZqiI"
+});
+
+
+mqttClient.on("connect", () => {
+    console.log("✅ MQTT backend connected");
+    mqttClient.subscribe("ekco/serial/custom/v1/geofenceUpdate", (err) => {
+        if (err) {
+            console.error("❌ Failed to subscribe:", err);
+        } else {
+            console.log("✅ Subscribed to geofence topic");
+        }
+    });
+
+});
+
+// Function to send geofence update to all relevant serials
+async function sendGeofenceUpdate() {
+  try {
+    // Get all unique device_serials from geofences table (trucks array contains device_serials)
+    const geofenceResult = await pool.query('SELECT DISTINCT unnest(trucks) as device_serial FROM geofences WHERE trucks IS NOT NULL');
+    const serials = geofenceResult.rows.map(row => row.device_serial).filter(serial => serial && serial.trim() !== '');
+    if (serials.length === 0) return;
+    for (const serial of serials) {
+      mqttClient.publish(`ekco/${serial}/custom/v1/geofenceUpdate`, '1', { retain: true });
+    }
+  } catch (error) {
+    console.error('Error sending geofence update:', error);
+  }
+}
+
+
 
 
 
@@ -77,10 +121,7 @@ app.get('/api/geofences/for-serial', async (req, res) => {
 app.post('/api/geofences', async (req, res) => {
   const { name, lat, lng, radius, active, trucks } = req.body;
 
-
-  const rawRadiusKm = radius / 1000;
-
-  const radiusKm = Math.round(rawRadiusKm * 100) / 100;
+  const radiusKm = radius / 1000;
 
  
   const centrePoint = `POINT(${lng} ${lat})`;
@@ -95,6 +136,7 @@ app.post('/api/geofences', async (req, res) => {
     const geofence = result.rows[0];
     const processedTrucks = Array.isArray(geofence.trucks) ? geofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
     res.status(201).json({ ...geofence, trucks: processedTrucks });
+   // await sendGeofenceUpdate();
   } catch (error) {
     console.error('Error creating geofence:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -106,10 +148,7 @@ app.put('/api/geofences/:id', async (req, res) => {
   const { id } = req.params;
   const { name, lat, lng, radius, active, trucks, color } = req.body;
 
-
-  const rawRadiusKm = radius / 1000;
-
-  const radiusKm = Math.round(rawRadiusKm * 100) / 100;
+  const radiusKm = radius / 1000;
 
 
   const centrePoint = `POINT(${lng} ${lat})`;
@@ -128,6 +167,7 @@ app.put('/api/geofences/:id', async (req, res) => {
     const geofence = result.rows[0];
     const processedTrucks = Array.isArray(geofence.trucks) ? geofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
     res.json({ ...geofence, trucks: processedTrucks });
+  //  await sendGeofenceUpdate();
   } catch (error) {
     console.error('Error updating geofence:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -145,7 +185,10 @@ app.delete('/api/geofences/:id', async (req, res) => {
       return res.status(404).json({ error: 'Geofence not found' });
     }
 
+    const deletedGeofence = result.rows[0];
+    const processedTrucks = Array.isArray(deletedGeofence.trucks) ? deletedGeofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
     res.json({ message: 'Geofence deleted successfully' });
+  //  await sendGeofenceUpdate();
   } catch (error) {
     console.error('Error deleting geofence:', error);
     res.status(500).json({ error: 'Internal server error' });
