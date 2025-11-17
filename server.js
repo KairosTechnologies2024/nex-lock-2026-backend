@@ -106,7 +106,7 @@ app.get('/api/geofences/for-serial', async (req, res) => {
   if (!truckId) return res.status(400).json({ error: 'Missing or invalid truck id in header `serial`' });
   try {
     const result = await pool.query(
-      'SELECT id, name, lat, lng, radius_km * 1000 as radius FROM geofences WHERE $1 = ANY(trucks) ORDER BY id',
+      'SELECT id, lat, lng, radius_km * 1000 as rad FROM geofences WHERE $1 = ANY(trucks) ORDER BY id',
       [truckId]
     );
 
@@ -136,7 +136,7 @@ app.post('/api/geofences', async (req, res) => {
     const geofence = result.rows[0];
     const processedTrucks = Array.isArray(geofence.trucks) ? geofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
     res.status(201).json({ ...geofence, trucks: processedTrucks });
-   // await sendGeofenceUpdate();
+   await sendGeofenceUpdate();
   } catch (error) {
     console.error('Error creating geofence:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -167,7 +167,7 @@ app.put('/api/geofences/:id', async (req, res) => {
     const geofence = result.rows[0];
     const processedTrucks = Array.isArray(geofence.trucks) ? geofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
     res.json({ ...geofence, trucks: processedTrucks });
-  //  await sendGeofenceUpdate();
+    await sendGeofenceUpdate();
   } catch (error) {
     console.error('Error updating geofence:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -188,7 +188,7 @@ app.delete('/api/geofences/:id', async (req, res) => {
     const deletedGeofence = result.rows[0];
     const processedTrucks = Array.isArray(deletedGeofence.trucks) ? deletedGeofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
     res.json({ message: 'Geofence deleted successfully' });
-  //  await sendGeofenceUpdate();
+  await sendGeofenceUpdate();
   } catch (error) {
     console.error('Error deleting geofence:', error);
     res.status(500).json({ error: 'Internal server error' });
