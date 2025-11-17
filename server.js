@@ -106,15 +106,23 @@ app.get('/api/geofences/for-serial', async (req, res) => {
   if (!truckId) return res.status(400).json({ error: 'Missing or invalid truck id in header `serial`' });
   try {
     const result = await pool.query(
-      'SELECT id, lat, lng, radius_km * 1000 as rad FROM geofences WHERE $1 = ANY(trucks) ORDER BY id',
+      'SELECT id, lat, lng, radius_km as rad FROM geofences WHERE $1 = ANY(trucks) ORDER BY id',
       [truckId]
     );
 
-    const data = result.rows;
-    const jsonString = JSON.stringify(data);
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Length', Buffer.byteLength(jsonString, 'utf8'));
-    res.send(jsonString);
+    const data = result.rows; 
+
+    let dataMapped = data.map(row => ({
+      id: row.id,
+      lat: parseFloat(row.lat),
+      lng: parseFloat(row.lng),
+      radius: parseFloat(row.rad)
+    }));
+   
+
+   // console.log('mapped data', dataMapped)
+   // console.log(data);
+    res.json(dataMapped);
   } catch (error) {
     console.error('Error fetching geofences for truck id', truckId, error);
     res.status(500).json({ error: 'Internal server error' });
