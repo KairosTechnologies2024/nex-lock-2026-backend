@@ -116,7 +116,7 @@ app.get('/api/geofences/for-serial', async (req, res) => {
       id: row.id,
       lat: parseFloat(row.lat),
       lng: parseFloat(row.lng),
-      radius: parseFloat(row.rad)
+      rad: parseFloat(row.rad)
     }));
    
 
