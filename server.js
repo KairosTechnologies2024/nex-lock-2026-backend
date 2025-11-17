@@ -100,7 +100,7 @@ app.get('/api/geofences', async (req, res) => {
 
 
 app.get('/api/geofences/for-serial', async (req, res) => {
-  // expects a numeric truck id in header `serial` (consider renaming to `truck_id`)
+
   const serial = req.headers.serial;
   const truckId = serial ? parseInt(serial, 10) : null;
   if (!truckId) return res.status(400).json({ error: 'Missing or invalid truck id in header `serial`' });
@@ -110,7 +110,11 @@ app.get('/api/geofences/for-serial', async (req, res) => {
       [truckId]
     );
 
-    res.json(result.rows);
+    const data = result.rows;
+    const jsonString = JSON.stringify(data);
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Length', Buffer.byteLength(jsonString, 'utf8'));
+    res.send(jsonString);
   } catch (error) {
     console.error('Error fetching geofences for truck id', truckId, error);
     res.status(500).json({ error: 'Internal server error' });
