@@ -7,6 +7,7 @@ const app = express();
 const port = process.env.PORT || 3001;
 const mqtt = require('mqtt');
 const mimeTypes = require('mime-types');
+const WebSocket = require('ws');
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -54,6 +55,56 @@ mqttClient.on("connect", () => {
         }
     });
 
+    // Subscribe to geofence alerts topic
+    mqttClient.subscribe("ekco/serial/custom/v1/geofenceAlert", (err) => {
+        if (err) {
+            console.error("❌ Failed to subscribe to geofence alerts:", err);
+        } else {
+            console.log("✅ Subscribed to geofence alerts topic");
+        }
+    });
+
+});
+
+// Handle incoming MQTT messages for geofence alerts
+mqttClient.on("message", async (topic, message) => {
+    if (topic.includes("geofenceAlert")) {
+        try {
+            const alertData = JSON.parse(message.toString());
+            console.log("Received geofence alert:", alertData);
+
+            // Fetch the latest alerts from the database
+            const result = await pool.query(`
+                SELECT
+                    ga.time,
+                    ga.geofence_id,
+                    ga.device_serial,
+                    ga.alert,
+                    g.name as geofence_name,
+                    COALESCE(vi.fleet_number, vi.vehicle_reg, 'Unknown Fleet') as fleet_name
+                FROM geofence_alert_ts ga
+                LEFT JOIN geofences g ON ga.geofence_id::bigint = g.id::bigint
+                LEFT JOIN vehicle_info vi ON ga.device_serial::text = vi.device_serial
+                ORDER BY ga.time DESC
+                LIMIT 100
+            `);
+
+            const alerts = result.rows.map(row => ({
+                id: `${row.geofence_id}-${row.device_serial}-${row.time}`,
+                type: row.alert === 'OUTSIDE GEOFENCE' ? 'Exit' : 'Entry',
+                fleetName: row.fleet_name,
+                geofenceName: row.geofence_name,
+                alertName: row.alert,
+                deviceSerial: row.device_serial,
+                alertTime: new Date(row.time * 1000).toISOString().slice(0, 19).replace('T', ' ')
+            }));
+
+            // Broadcast the updated alerts to all WebSocket clients
+            broadcastGeofenceAlerts(alerts);
+        } catch (error) {
+            console.error("Error processing geofence alert:", error);
+        }
+    }
 });
 
 // Function to send geofence update to all relevant serials
@@ -208,6 +259,41 @@ app.delete('/api/geofences/:id', async (req, res) => {
 });
 
 
+app.get('/api/geofence-alerts', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        ga.time,
+        ga.geofence_id,
+        ga.device_serial,
+        ga.alert,
+        g.name as geofence_name,
+        COALESCE(vi.fleet_number, vi.vehicle_reg, 'Unknown Fleet') as fleet_name
+      FROM geofence_alert_ts ga
+      LEFT JOIN geofences g ON ga.geofence_id::bigint = g.id::bigint
+      LEFT JOIN vehicle_info vi ON ga.device_serial::text = vi.device_serial
+
+      ORDER BY ga.time DESC
+      LIMIT 100
+    `);
+
+    const alerts = result.rows.map(row => ({
+      id: `${row.geofence_id}-${row.device_serial}-${row.time}`,
+      type: row.alert === 'OUTSIDE GEOFENCE'? 'Exit' : 'Entry', 
+      fleetName: row.fleet_name,
+      geofenceName: row.geofence_name,
+      alertName: row.alert,
+      deviceSerial: row.device_serial,
+      alertTime: new Date(row.time * 1000).toISOString().slice(0, 19).replace('T', ' ')
+    }));
+
+    res.json(alerts);
+  } catch (error) {
+    console.error('Error fetching geofence alerts:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
 app.get('/api/trucks', async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM vehicle_info order by id');
@@ -255,9 +341,33 @@ app.use((err, req, res, next) => {
 });
 
 // Start server
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`Server running on port ${port}`);
 });
+
+// WebSocket server
+const wss = new WebSocket.Server({ server });
+
+wss.on('connection', (ws) => {
+  console.log('New WebSocket connection');
+
+  ws.on('message', (message) => {
+    console.log('Received:', message);
+  });
+
+  ws.on('close', () => {
+    console.log('WebSocket connection closed');
+  });
+});
+
+// Function to broadcast geofence alerts to all connected clients
+function broadcastGeofenceAlerts(alerts) {
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(JSON.stringify({ type: 'geofence-alerts', data: alerts }));
+    }
+  });
+}
 
 // Graceful shutdown
 process.on('SIGINT', () => {
