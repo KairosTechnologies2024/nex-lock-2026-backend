@@ -154,7 +154,7 @@ app.get('/api/geofences/for-serial', async (req, res) => {
   if (!truckId) return res.status(400).json({ error: 'Missing or invalid truck id in header `serial`' });
   try {
     const result = await pool.query(
-      'SELECT id, lat, lng, radius_km as rad FROM geofences WHERE $1 = ANY(trucks) ORDER BY id',
+      'SELECT id, lat, lng, radius_km as rad FROM geofences WHERE $1 = ANY(trucks) AND active = true ORDER BY id',
       [truckId]
     );
 
