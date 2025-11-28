@@ -8,6 +8,8 @@ const port = process.env.PORT || 3001;
 const mqtt = require('mqtt');
 const mimeTypes = require('mime-types');
 const WebSocket = require('ws');
+const authController = require('./controllers/auth/nex super users/nex_auth_supers_controller');
+const authRoutes= require('./routes/nex_auth_routes');
 // Middleware
 app.use(cors());
 app.use(express.json());
@@ -84,17 +86,19 @@ mqttClient.on("connect", () => {
 });
  */
 // Function to send geofence update to all relevant serials
-async function sendGeofenceUpdate() {
+async function sendGeofenceUpdate(serials = null) {
   try {
-    // Get all unique device_serials from geofences table
-    const geofenceResult = await pool.query('SELECT DISTINCT unnest(trucks) as device_serial FROM geofences WHERE trucks IS NOT NULL');
-    const serials = geofenceResult.rows.map(row => row.device_serial).filter(serial => serial && serial.trim() !== '');
+  
+    if (!serials) {
+      const geofenceResult = await pool.query('SELECT DISTINCT unnest(trucks) as device_serial FROM geofences WHERE trucks IS NOT NULL');
+      serials = geofenceResult.rows.map(row => row.device_serial).filter(serial => serial && serial.trim() !== '');
+    }
 
     if (serials.length === 0) {
       return;
     }
 
-    // Send updates to all serials
+  
     const updatePromises = serials.map(serial =>
       new Promise((res, rej) => {
         mqttClient.publish(`ekco/${serial}/custom/v1/geofenceUpdate`, '1', { retain: true }, (error) => {
@@ -108,7 +112,7 @@ async function sendGeofenceUpdate() {
       })
     );
 
-    // Wait for all updates to complete, allowing partial failures
+   
     const results = await Promise.allSettled(updatePromises);
     const failed = results.filter(result => result.status === 'rejected');
     if (failed.length > 0) {
@@ -130,7 +134,7 @@ app.get('/api/geofences', async (req, res) => {
   const result = await pool.query('SELECT id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color FROM geofences ORDER BY id');
 
     const geofences = result.rows.map(row => {
-      // trucks is now stored as bigint[]; ensure we return an array of numbers
+
       let trucks = row.trucks;
       if (!Array.isArray(trucks)) {
         trucks = [];
@@ -196,11 +200,10 @@ app.post('/api/geofences', async (req, res) => {
     const geofence = result.rows[0];
     const processedTrucks = Array.isArray(geofence.trucks) ? geofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
     
-    // Wait for both database write and MQTT update
- 
+  
+    await sendGeofenceUpdate(processedTrucks);
     
     res.status(201).json({ ...geofence, trucks: processedTrucks });
-       await sendGeofenceUpdate();
   } catch (error) {
     console.error('Error creating geofence:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -216,6 +219,10 @@ app.put('/api/geofences/:id', async (req, res) => {
   const centrePoint = `POINT(${lng} ${lat})`;
 
   try {
+    // Get the old trucks before update
+    const oldGeofence = await pool.query('SELECT trucks FROM geofences WHERE id = $1', [id]);
+    const oldTrucks = oldGeofence.rows[0]?.trucks || [];
+
     const result = await pool.query(
       'UPDATE geofences SET name = $1, lat = $2, lng = $3, radius_km = $4, active = $5, trucks = $6, color = $7, centre_point = ST_GeogFromText($8) WHERE id = $9 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
       [name, lat, lng, radiusKm, active, trucks, color, centrePoint, id]
@@ -228,11 +235,11 @@ app.put('/api/geofences/:id', async (req, res) => {
     const geofence = result.rows[0];
     const processedTrucks = Array.isArray(geofence.trucks) ? geofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
     
-    // Wait for both database update and MQTT update
-
+   
+    const allAffectedTrucks = [...new Set([...oldTrucks, ...processedTrucks])];
+    await sendGeofenceUpdate(allAffectedTrucks);
     
     res.json({ ...geofence, trucks: processedTrucks });
-        await sendGeofenceUpdate();
   } catch (error) {
     console.error('Error updating geofence:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -244,23 +251,135 @@ app.delete('/api/geofences/:id', async (req, res) => {
   const { id } = req.params;
 
   try {
+    // Get the trucks before deletion
+    const geofence = await pool.query('SELECT trucks FROM geofences WHERE id = $1', [id]);
+    const trucks = geofence.rows[0]?.trucks || [];
+
     const result = await pool.query('DELETE FROM geofences WHERE id = $1 RETURNING *', [id]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Geofence not found' });
     }
 
-    const deletedGeofence = result.rows[0];
-    const processedTrucks = Array.isArray(deletedGeofence.trucks) ? deletedGeofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
-    
-    // Wait for both database delete and MQTT update
+    const processedTrucks = Array.isArray(trucks) ? trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
+    await sendGeofenceUpdate(processedTrucks);
 
-    
     res.json({ message: 'Geofence deleted successfully' });
-        await sendGeofenceUpdate();
   } catch (error) {
     console.error('Error deleting geofence:', error);
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+app.post('/api/geofences/bulk', async (req, res) => {
+  const geofences = req.body;
+
+  if (!Array.isArray(geofences) || geofences.length === 0) {
+    return res.status(400).json({ error: 'Geofences array is required' });
+  }
+
+  const created = [];
+  const errors = [];
+
+  try {
+    for (const geofence of geofences) {
+      try {
+        const { name, lat, lng, radius, active, trucks } = geofence;
+
+        if (!name || typeof lat !== 'number' || typeof lng !== 'number' || typeof radius !== 'number') {
+          errors.push({ name: name || 'Unknown', error: 'Invalid geofence data' });
+          continue;
+        }
+
+        const radiusKm = radius / 1000;
+        const centrePoint = `POINT(${lng} ${lat})`;
+
+        const result = await pool.query(
+          'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8)) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
+          [name, lat, lng, radiusKm, active !== false, trucks || [], generateRandomColor(), centrePoint]
+        );
+
+        if (result.rows.length > 0) {
+          const createdGeofence = result.rows[0];
+          const processedTrucks = Array.isArray(createdGeofence.trucks) ? createdGeofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
+          created.push({ ...createdGeofence, trucks: processedTrucks });
+        } else {
+          errors.push({ name, error: 'Failed to create geofence' });
+        }
+      } catch (geofenceError) {
+        console.error('Error creating geofence:', geofence.name, geofenceError);
+        errors.push({ name: geofence.name || 'Unknown', error: geofenceError.message });
+      }
+    }
+
+    // Send MQTT update after all geofences are created
+    if (created.length > 0) {
+      await sendGeofenceUpdate();
+    }
+
+    res.status(201).json({
+      message: `Successfully created ${created.length} geofences${errors.length > 0 ? ` with ${errors.length} errors` : ''}`,
+      created,
+      errors
+    });
+  } catch (error) {
+    console.error('Error in bulk geofence creation:', error);
+    res.status(500).json({ error: 'Internal server error during bulk creation' });
+  }
+});
+
+app.post('/api/geofences/bulk', async (req, res) => {
+  const geofences = req.body;
+
+  if (!Array.isArray(geofences) || geofences.length === 0) {
+    return res.status(400).json({ error: 'Invalid geofences data' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const createdGeofences = [];
+    const errors = [];
+
+    for (const geofence of geofences) {
+      try {
+        const { name, lat, lng, radius, active, trucks } = geofence;
+        const radiusKm = radius / 1000;
+        const centrePoint = `POINT(${lng} ${lat})`;
+
+        const result = await client.query(
+          'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8)) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
+          [name, lat, lng, radiusKm, active, trucks, generateRandomColor(), centrePoint]
+        );
+
+        if (result.rows.length > 0) {
+          const createdGeofence = result.rows[0];
+          const processedTrucks = Array.isArray(createdGeofence.trucks) ? createdGeofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
+          createdGeofences.push({ ...createdGeofence, trucks: processedTrucks });
+        }
+      } catch (error) {
+        console.error('Error creating geofence:', geofence.name, error);
+        errors.push(`Failed to create geofence for ${geofence.name}: ${error.message}`);
+      }
+    }
+
+    await client.query('COMMIT');
+
+    // Send MQTT update after all geofences are created
+    await sendGeofenceUpdate();
+
+    res.status(201).json({
+      created: createdGeofences,
+      errors: errors
+    });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Error in bulk geofence creation:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  } finally {
+    client.release();
   }
 });
 
@@ -337,6 +456,9 @@ function generateRandomColor() {
   }
   return color;
 }
+
+// Auth routes (including customers)
+app.use('/api', authRoutes);
 
 //Use the client app
 app.use(express.static(path.join(__dirname, '/client/dist'), {
