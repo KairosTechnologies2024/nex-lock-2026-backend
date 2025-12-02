@@ -69,22 +69,23 @@ mqttClient.on("connect", () => {
 });
 
 // MQTT message handler - broadcast immediately for real-time alerts
-/* mqttClient.on("message", async (topic, message) => {
+mqttClient.on("message", async (topic, message) => {
     if (topic.includes("geofenceAlert")) {
         try {
             const alertData = JSON.parse(message.toString());
-            console.log("Received geofence alert:", alertData);
+            console.log("📡 MQTT Received geofence alert:", alertData);
             // Fetch full alert details from DB
             const fullAlert = await fetchAlertDetails(alertData);
             if (fullAlert) {
-                broadcastGeofenceAlerts([fullAlert]);
+                console.log("📡 Broadcasting real-time geofence alert:", fullAlert);
+                broadcastSingleAlert(fullAlert);
             }
         } catch (error) {
-            console.error("Error processing geofence alert:", error);
+            console.error("❌ Error processing MQTT geofence alert:", error);
         }
     }
 });
- */
+
 // Function to send geofence update to all relevant serials
 async function sendGeofenceUpdate(serials = null) {
   try {
@@ -430,6 +431,53 @@ app.get('/api/trucks', async (req, res) => {
   }
 });
 
+
+app.get('/api/alerts/latest200', async (req, res)=>{
+
+
+ try {
+        const result = await pool.query(`
+            SELECT * 
+            FROM alert_ts 
+            ORDER BY time DESC 
+            LIMIT 200
+        `);
+        console.log('latest 200 ', result.rows)
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: "Database error", details: err.message });
+    }
+
+
+});
+app.get('/api/alerts/latest', async (req, res)=>{
+
+
+ try {
+        const result = await pool.query(`
+            SELECT DISTINCT ON (device_serial) *
+            FROM alert_ts
+            ORDER BY device_serial, time DESC
+        `);
+        console.log(result.rows)
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: "Database error", details: err.message });
+    }
+
+
+});
+
+
+
+
+
+
+
+
+
+
+
 // Test route to trigger WebSocket broadcast for logging verification
 app.get('/test-broadcast', (req, res) => {
   const testAlerts = [
@@ -506,6 +554,21 @@ wss.on('connection', (ws) => {
   });
 });
 
+function broadcast(data) {
+    const message = JSON.stringify(data);
+    wss.clients.forEach((client) => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(message);
+        } else {
+            console.log("Client not open:", client.readyState);
+        }
+    });
+}
+
+
+
+
+
 // Function to parse EWKB POINT hex string to lat/lng
 function parseEWKBPoint(hex) {
   const bytes = new Uint8Array(hex.match(/.{1,2}/g).map(b => parseInt(b, 16)));
@@ -523,6 +586,122 @@ function parseEWKBPoint(hex) {
   }
   throw new Error('Not a POINT geometry');
 }
+
+
+
+
+
+
+
+// ---------------- Alerts Broadcast ---------------- //
+
+// let latestAlertTimestamp = 0;
+// let latestAlertTimestamp;
+latestAlertTimestamp = Math.floor(Date.now() / 1000) - 60;
+
+(async () => {
+    const res = await pool.query('SELECT MAX(time)::bigint AS latest FROM alert_ts');
+    const maxDBTime = parseInt(res.rows[0].latest) || 0;
+    const now = Math.floor(Date.now() / 1000);
+    const sixtySecondsAgo = now - 60;
+
+    if (maxDBTime > now) {
+        console.warn("⚠️ maxDBTime is in the future! Resetting to now:", now);
+        latestAlertTimestamp = now;
+    } else if (maxDBTime < sixtySecondsAgo) {
+        console.log("✅ Using maxDBTime from DB:", maxDBTime);
+        latestAlertTimestamp = maxDBTime;
+    } else {
+        console.log("🕒 DB time is recent or missing. Using now - 60s:", sixtySecondsAgo);
+        latestAlertTimestamp = sixtySecondsAgo;
+    }
+
+    console.log("🔧 Initial latestAlertTimestamp set to:", latestAlertTimestamp);
+
+    setInterval(broadcastAlerts, 3000);
+})();
+
+
+async function broadcastAlerts() {
+    try {
+        const now = Math.floor(Date.now() / 1000);
+        // console.log("🕵️‍♂️ Checking for alerts after:", latestAlertTimestamp);
+
+        const result = await pool.query(
+            `
+            SELECT time::bigint AS time, device_serial, alert 
+            FROM alert_ts 
+            WHERE time::bigint > $1 
+            ORDER BY time DESC
+            `,
+            [latestAlertTimestamp]
+        );
+
+        // console.log("🔍 Raw new alerts:", result.rows.map(r => ({
+        //     time: r.time,
+        //     alert: r.alert
+        // })));
+
+        if (result.rows.length === 0) {
+            // console.log("📭 No new alerts found.");
+            return;
+        }
+
+        // Discard alerts in the future
+        const validAlerts = result.rows.filter(r => {
+            const t = parseInt(r.time);
+            if (t > now) {
+                // console.warn(`⚠️ Skipping future alert time=${t} (now=${now}, skew=${t - now}s)`);
+                return false;
+            }
+            return true;
+        });
+
+        if (validAlerts.length === 0) {
+            // console.log("🚫 All alerts are in the future. Skipping broadcast.");
+            return;
+        }
+
+        // Optional: Log how many were skipped
+        const skippedCount = result.rows.length - validAlerts.length;
+        if (skippedCount > 0) {
+            // console.log(`🧹 Skipped ${skippedCount} future-dated alerts.`);
+        }
+
+        // Filter unimportant alerts
+        const filteredAlerts = validAlerts.filter(r =>
+            r.alert !== "Door opened" && r.alert !== "Ignition on"
+        );
+
+        if (filteredAlerts.length > 0) {
+            const alertTimes = filteredAlerts.map(r => parseInt(r.time));
+            const maxTime = Math.max(...alertTimes);
+
+            // console.log("📤 Filtered new alerts to broadcast:", filteredAlerts.map(r => ({
+            //     time: r.time,
+            //     alert: r.alert
+            // })));
+
+            latestAlertTimestamp = maxTime + 1;
+
+            broadcast({
+                type: "alert_update",
+                data: filteredAlerts,
+            });
+        } else {
+            // All valid, but filtered out as unimportant
+            const allTimes = validAlerts.map(r => parseInt(r.time));
+            latestAlertTimestamp = Math.max(...allTimes) + 1;
+            // console.log("⚠️ All alerts filtered out. Timestamp updated anyway.");
+        }
+
+    } catch (err) {
+        console.error("❌ Error broadcasting alerts:", err.message);
+    }
+}
+
+
+
 
 // Function to fetch live truck data
 async function fetchLiveTrucks() {
@@ -636,57 +815,95 @@ async function fetchLatestAlert() {
   }
 }
 
-// Store the ID of the last sent alert
-let lastSentAlertId = null;
+// Store the timestamp of the last sent geofence alert
+let latestGeofenceAlertTimestamp = Math.floor(Date.now() / 1000) - 60;
 
-// SINGLE SOURCE: Broadcast alerts only through database polling
+// Function to broadcast a single geofence alert
 function broadcastSingleAlert(alert) {
-  const alertId = alert.id;
-  
-  // Check if we recently sent this alert
-  if (alertId === lastSentAlertId) {
-    console.log('🟡 Duplicate alert detected, skipping:', alertId);
-    return;
-  }
-  
-  console.log('📡 Broadcasting new alert via database polling:', alert);
-  
-  // Send as single alert
-  const message = JSON.stringify({ 
-    type: 'new-alert', 
-    data: alert 
+  console.log('📡 Broadcasting geofence alert:', alert);
+
+  const message = JSON.stringify({
+    type: 'new-alert',
+    data: alert
   });
-  
+
   wss.clients.forEach(client => {
     if (client.readyState === WebSocket.OPEN) {
       client.send(message);
     }
   });
-  
-  // Update last sent ID
-  lastSentAlertId = alertId;
 }
 
-// Function to check for and broadcast the latest new alert
-async function checkAndBroadcastLatestAlert() {
+// Function to check for and broadcast new geofence alerts
+async function checkAndBroadcastNewGeofenceAlerts() {
   try {
-    const latestAlert = await fetchLatestAlert();
-    
-    if (latestAlert && latestAlert.id !== lastSentAlertId) {
-      console.log('🟢 Database poll found new alert:', latestAlert.id);
-      broadcastSingleAlert(latestAlert);
-    } else if (latestAlert) {
-      console.log('🟡 Database poll - no new alerts (latest:', latestAlert.id, ')');
-    } else {
-      console.log('🟡 Database poll - no alerts found');
+    const now = Math.floor(Date.now() / 1000);
+    console.log("🔍 Checking for new geofence alerts after:", latestGeofenceAlertTimestamp);
+
+    const result = await pool.query(`
+      SELECT
+        ga.time,
+        ga.geofence_id,
+        ga.device_serial,
+        ga.alert,
+        g.name as geofence_name,
+        COALESCE(vi.fleet_number, vi.vehicle_reg, 'Unknown Fleet') as fleet_name
+      FROM geofence_alert_ts ga
+      LEFT JOIN geofences g ON ga.geofence_id::bigint = g.id::bigint
+      LEFT JOIN vehicle_info vi ON ga.device_serial::text = vi.device_serial
+      WHERE ga.time > $1
+      ORDER BY ga.time DESC
+    `, [latestGeofenceAlertTimestamp]);
+
+    if (result.rows.length === 0) {
+      console.log("📭 No new geofence alerts found.");
+      return;
     }
+
+    // Discard alerts in the future
+    const validAlerts = result.rows.filter(r => {
+      const t = parseInt(r.time);
+      if (t > now) {
+        console.warn(`⚠️ Skipping future geofence alert time=${t} (now=${now}, skew=${t - now}s)`);
+        return false;
+      }
+      return true;
+    });
+
+    if (validAlerts.length === 0) {
+      console.log("🚫 All geofence alerts are in the future. Skipping broadcast.");
+      return;
+    }
+
+    // Process and broadcast new alerts
+    const newAlerts = validAlerts.map(row => ({
+      id: `${row.geofence_id}-${row.device_serial}-${row.time}`,
+      type: row.alert === 'OUTSIDE GEOFENCE' ? 'Exit' : 'Entry',
+      fleetName: row.fleet_name,
+      geofenceName: row.geofence_name,
+      alertName: row.alert,
+      deviceSerial: row.device_serial,
+      alertTime: new Date(row.time * 1000).toISOString().slice(0, 19).replace('T', ' ')
+    }));
+
+    // Update timestamp to the latest alert time + 1
+    const maxTime = Math.max(...validAlerts.map(r => parseInt(r.time)));
+    latestGeofenceAlertTimestamp = maxTime + 1;
+
+    console.log("📤 Broadcasting new geofence alerts:", newAlerts.length);
+
+    // Broadcast each new alert
+    newAlerts.forEach(alert => {
+      broadcastSingleAlert(alert);
+    });
+
   } catch (error) {
-    console.error('Error in database alert check:', error);
+    console.error("❌ Error checking for new geofence alerts:", error);
   }
 }
 
-// Check for new alerts every 3 seconds (reduced frequency)
-setInterval(checkAndBroadcastLatestAlert, 3000);
+// Check for new geofence alerts every 2 seconds (more frequent than regular alerts)
+setInterval(checkAndBroadcastNewGeofenceAlerts, 2000);
 
 // Function to fetch and broadcast live trucks
 async function fetchAndBroadcastLiveTrucks() {
