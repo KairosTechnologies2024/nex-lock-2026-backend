@@ -189,6 +189,27 @@ app.post('/api/geofences', async (req, res) => {
   const centrePoint = `POINT(${lng} ${lat})`;
 
   try {
+
+    const nameCheck = await pool.query('SELECT id FROM geofences WHERE name = $1', [name]);
+    if (nameCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'Geofence name already exists. Please choose a different name.' });
+    }
+
+  
+    const pointCheck = await pool.query('SELECT id FROM geofences WHERE lat = $1 AND lng = $2', [lat, lng]);
+    if (pointCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'Geofence with the same centre point already exists. Please choose a different location.' });
+    }
+
+    const overlapCheck = await pool.query(
+      'SELECT id FROM geofences WHERE ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, radius_km * 1000)',
+      [lng, lat]
+    );
+
+    if (overlapCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'Geofence centre point is within the radius of an existing geofence. Please choose a different location.' });
+    }
+
     const result = await pool.query(
       'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8)) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
       [name, lat, lng, radiusKm, active, trucks, generateRandomColor(), centrePoint]
@@ -200,10 +221,10 @@ app.post('/api/geofences', async (req, res) => {
 
     const geofence = result.rows[0];
     const processedTrucks = Array.isArray(geofence.trucks) ? geofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
-    
-  
+
+
     await sendGeofenceUpdate(processedTrucks);
-    
+
     res.status(201).json({ ...geofence, trucks: processedTrucks });
   } catch (error) {
     console.error('Error creating geofence:', error);
@@ -220,6 +241,22 @@ app.put('/api/geofences/:id', async (req, res) => {
   const centrePoint = `POINT(${lng} ${lat})`;
 
   try {
+    // Check if the new name already exists (excluding the current geofence)
+    const nameCheck = await pool.query('SELECT id FROM geofences WHERE name = $1 AND id != $2', [name, id]);
+    if (nameCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'Geofence name already exists. Please choose a different name.' });
+    }
+
+    // Check if the new centre point is within the radius of any existing geofence (excluding the current one)
+    const overlapCheck = await pool.query(
+      'SELECT id FROM geofences WHERE ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, radius_km * 1000) AND id != $3',
+      [lng, lat, id]
+    );
+
+    if (overlapCheck.rows.length > 0) {
+      return res.status(400).json({ error: 'Geofence centre point is within the radius of an existing geofence. Please choose a different location.' });
+    }
+
     // Get the old trucks before update
     const oldGeofence = await pool.query('SELECT trucks FROM geofences WHERE id = $1', [id]);
     const oldTrucks = oldGeofence.rows[0]?.trucks || [];
@@ -235,11 +272,11 @@ app.put('/api/geofences/:id', async (req, res) => {
 
     const geofence = result.rows[0];
     const processedTrucks = Array.isArray(geofence.trucks) ? geofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
-    
-   
+
+
     const allAffectedTrucks = [...new Set([...oldTrucks, ...processedTrucks])];
     await sendGeofenceUpdate(allAffectedTrucks);
-    
+
     res.json({ ...geofence, trucks: processedTrucks });
   } catch (error) {
     console.error('Error updating geofence:', error);
@@ -273,62 +310,7 @@ app.delete('/api/geofences/:id', async (req, res) => {
 });
 
 
-app.post('/api/geofences/bulk', async (req, res) => {
-  const geofences = req.body;
 
-  if (!Array.isArray(geofences) || geofences.length === 0) {
-    return res.status(400).json({ error: 'Geofences array is required' });
-  }
-
-  const created = [];
-  const errors = [];
-
-  try {
-    for (const geofence of geofences) {
-      try {
-        const { name, lat, lng, radius, active, trucks } = geofence;
-
-        if (!name || typeof lat !== 'number' || typeof lng !== 'number' || typeof radius !== 'number') {
-          errors.push({ name: name || 'Unknown', error: 'Invalid geofence data' });
-          continue;
-        }
-
-        const radiusKm = radius / 1000;
-        const centrePoint = `POINT(${lng} ${lat})`;
-
-        const result = await pool.query(
-          'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8)) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
-          [name, lat, lng, radiusKm, active !== false, trucks || [], generateRandomColor(), centrePoint]
-        );
-
-        if (result.rows.length > 0) {
-          const createdGeofence = result.rows[0];
-          const processedTrucks = Array.isArray(createdGeofence.trucks) ? createdGeofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
-          created.push({ ...createdGeofence, trucks: processedTrucks });
-        } else {
-          errors.push({ name, error: 'Failed to create geofence' });
-        }
-      } catch (geofenceError) {
-        console.error('Error creating geofence:', geofence.name, geofenceError);
-        errors.push({ name: geofence.name || 'Unknown', error: geofenceError.message });
-      }
-    }
-
-    // Send MQTT update after all geofences are created
-    if (created.length > 0) {
-      await sendGeofenceUpdate();
-    }
-
-    res.status(201).json({
-      message: `Successfully created ${created.length} geofences${errors.length > 0 ? ` with ${errors.length} errors` : ''}`,
-      created,
-      errors
-    });
-  } catch (error) {
-    console.error('Error in bulk geofence creation:', error);
-    res.status(500).json({ error: 'Internal server error during bulk creation' });
-  }
-});
 
 app.post('/api/geofences/bulk', async (req, res) => {
   const geofences = req.body;
@@ -342,42 +324,140 @@ app.post('/api/geofences/bulk', async (req, res) => {
     await client.query('BEGIN');
 
     const createdGeofences = [];
+    const updatedGeofences = [];
     const errors = [];
+    const allAffectedTrucks = new Set();
 
     for (const geofence of geofences) {
       try {
         const { name, lat, lng, radius, active, trucks } = geofence;
+
+        if (!name || typeof lat !== 'number' || typeof lng !== 'number' || typeof radius !== 'number') {
+          errors.push(`Invalid geofence data for ${name || 'Unknown'}`);
+          continue;
+        }
+
         const radiusKm = radius / 1000;
         const centrePoint = `POINT(${lng} ${lat})`;
 
-        const result = await client.query(
-          'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8)) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
-          [name, lat, lng, radiusKm, active, trucks, generateRandomColor(), centrePoint]
-        );
+        // Normalize incoming trucks to canonical device_serial values (and create missing vehicle_info rows)
+    // Normalize incoming trucks to canonical device_serial values.
+// Do NOT create missing vehicle_info rows; if any identifiers are unknown, skip this geofence entry.
+const { normalized: processedNewTrucks, missing: missingIdentifiers } = await normalizeTruckIdentifiers(client, Array.isArray(trucks) ? trucks : []);
 
-        if (result.rows.length > 0) {
-          const createdGeofence = result.rows[0];
-          const processedTrucks = Array.isArray(createdGeofence.trucks) ? createdGeofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
-          createdGeofences.push({ ...createdGeofence, trucks: processedTrucks });
+// If there are missing identifiers, skip this geofence and record an error to avoid creating blank/invalid geofences.
+if (missingIdentifiers && missingIdentifiers.length > 0) {
+  errors.push(`Geofence "${name}": unknown truck identifiers: ${missingIdentifiers.join(', ')}`);
+  continue;
+}
+        let existingGeofence = null;
+
+        // Check for duplicate name
+        const nameCheck = await client.query('SELECT id, trucks FROM geofences WHERE name = $1', [name]);
+        if (nameCheck.rows.length > 0) {
+          existingGeofence = nameCheck.rows[0];
+        } else {
+          // Check for duplicate centre point
+          const pointCheck = await client.query('SELECT id, trucks FROM geofences WHERE lat = $1 AND lng = $2', [lat, lng]);
+          if (pointCheck.rows.length > 0) {
+            existingGeofence = pointCheck.rows[0];
+          }
+        }
+
+        if (existingGeofence) {
+          const oldTrucks = Array.isArray(existingGeofence.trucks) ? existingGeofence.trucks.map(String) : [];
+
+          // Always overwrite the trucks list with the processed incoming list.
+          // An explicit empty list or an omitted trucks field will now clear existing trucks.
+          const result = await client.query(
+            'UPDATE geofences SET trucks = $1 WHERE id = $2 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
+            [processedNewTrucks, existingGeofence.id]
+          );
+
+          if (result.rows.length > 0) {
+            const updatedGeofence = result.rows[0];
+            updatedGeofences.push({ ...updatedGeofence, trucks: processedNewTrucks });
+
+            // Track affected trucks (old and new) so MQTT notifications go out
+            oldTrucks.forEach(t => allAffectedTrucks.add(t));
+            processedNewTrucks.forEach(t => allAffectedTrucks.add(t));
+          }
+        } else {
+          // Check for overlap with existing geofences. If overlap found, merge incoming trucks into the nearest parent geofence
+          const overlapCheck = await client.query(
+            `SELECT id, trucks
+             FROM geofences
+             WHERE ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, radius_km * 1000)
+             ORDER BY ST_Distance(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography)
+             LIMIT 1`,
+            [lng, lat]
+          );
+
+          if (overlapCheck.rows.length > 0) {
+            // Found an existing parent/overlapping geofence — merge trucks into it instead of creating a nested geofence
+            const parent = overlapCheck.rows[0];
+            const parentTrucks = Array.isArray(parent.trucks) ? parent.trucks.map(String) : [];
+            const incomingTrucks = processedNewTrucks.map(String);
+
+            // Merge and deduplicate
+            const mergedTrucks = [...new Set([...parentTrucks, ...incomingTrucks])];
+
+            try {
+              const updateParent = await client.query(
+                'UPDATE geofences SET trucks = $1 WHERE id = $2 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
+                [mergedTrucks, parent.id]
+              );
+
+              if (updateParent.rows.length > 0) {
+                const updatedParent = updateParent.rows[0];
+                updatedGeofences.push({ ...updatedParent, trucks: mergedTrucks });
+
+                // Track affected trucks (old parent trucks + incoming)
+                parentTrucks.forEach(t => allAffectedTrucks.add(t));
+                incomingTrucks.forEach(t => allAffectedTrucks.add(t));
+              } else {
+                errors.push(`Failed to merge trucks into overlapping geofence (parent id ${parent.id}) for ${name}`);
+              }
+            } catch (err) {
+              console.error('Error merging trucks into parent geofence:', err);
+              errors.push(`Failed to merge trucks into overlapping geofence (parent id ${parent.id}) for ${name}: ${err && err.message ? err.message : err}`);
+            }
+
+            // Do not create a new geofence for this overlapping entry; continue processing next input
+            continue;
+          }
+
+          // Create new geofence using processed truck list
+          const insertResult = await client.query(
+            'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8)) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
+            [name, lat, lng, radiusKm, active, processedNewTrucks, generateRandomColor(), centrePoint]
+          );
+
+          if (insertResult.rows.length > 0) {
+            const created = insertResult.rows[0];
+            createdGeofences.push({ ...created, trucks: processedNewTrucks });
+            processedNewTrucks.forEach(t => allAffectedTrucks.add(t));
+          }
         }
       } catch (error) {
-        console.error('Error creating geofence:', geofence.name, error);
-        errors.push(`Failed to create geofence for ${geofence.name}: ${error.message}`);
+        console.error('Error processing geofence:', geofence && geofence.name, error);
+        errors.push(`Failed to process geofence for ${geofence && geofence.name}: ${error && error.message ? error.message : error}`);
       }
     }
 
     await client.query('COMMIT');
 
-    // Send MQTT update after all geofences are created
-    await sendGeofenceUpdate();
+    // Send MQTT update to all affected trucks
+    await sendGeofenceUpdate(Array.from(allAffectedTrucks));
 
-    res.status(201).json({
+    res.status(200).json({
       created: createdGeofences,
+      updated: updatedGeofences,
       errors: errors
     });
   } catch (error) {
     await client.query('ROLLBACK');
-    console.error('Error in bulk geofence creation:', error);
+    console.error('Error in bulk geofence processing:', error);
     res.status(500).json({ error: 'Internal server error' });
   } finally {
     client.release();
@@ -467,8 +547,6 @@ app.get('/api/alerts/latest', async (req, res)=>{
 
 
 });
-
-
 
 
 
@@ -928,3 +1006,48 @@ process.on('SIGINT', () => {
     process.exit(0);
   });
 });
+
+// Helper: normalize incoming truck identifiers to canonical device_serial values using vehicle_info.
+// If an identifier (device_serial, vehicle_reg or fleet_number) doesn't exist, insert a minimal vehicle_info row.
+// Helper: normalize incoming truck identifiers to canonical device_serial values using vehicle_info.
+// If an identifier (device_serial, vehicle_reg or fleet_number) doesn't exist, DO NOT create a new vehicle_info row.
+// Instead return the normalized device_serials and the list of missing identifiers so callers can decide how to handle them.
+async function normalizeTruckIdentifiers(client, truckInputs = []) {
+  const normalized = [];
+  const missing = [];
+
+  for (const raw of truckInputs || []) {
+    try {
+      const idStr = String(raw || '').trim();
+      if (!idStr) continue;
+
+      // Find existing vehicle by device_serial, vehicle_reg or fleet_number
+      const found = await client.query(
+        `SELECT device_serial FROM vehicle_info
+         WHERE device_serial = $1 OR vehicle_reg = $1 OR fleet_number = $1
+         LIMIT 1`,
+        [idStr]
+      );
+
+      if (found.rows.length > 0 && found.rows[0].device_serial) {
+        normalized.push(String(found.rows[0].device_serial));
+      } else {
+        // Not found: record as missing (do NOT insert)
+        missing.push(idStr);
+      }
+    } catch (err) {
+      console.warn('normalizeTruckIdentifiers error for', raw, err && err.message ? err.message : err);
+      // On lookup error, mark identifier as missing for safety
+      try {
+        const idStr = String(raw || '').trim();
+        if (idStr) missing.push(idStr);
+      } catch (ignore) {}
+    }
+  }
+
+  // Deduplicate preserving order
+  const uniqueNormalized = [...new Set(normalized)];
+  const uniqueMissing = [...new Set(missing.filter(m => !uniqueNormalized.includes(m)))];
+
+  return { normalized: uniqueNormalized, missing: uniqueMissing };
+}
