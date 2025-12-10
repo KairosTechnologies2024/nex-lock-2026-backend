@@ -481,7 +481,7 @@ app.get('/api/geofence-alerts', async (req, res) => {
       LEFT JOIN vehicle_info vi ON ga.device_serial::text = vi.device_serial
 
       ORDER BY ga.time DESC
-      LIMIT 100
+      LIMIT 1000
     `);
 
     const alerts = result.rows.map(row => ({
