@@ -322,6 +322,17 @@ app.post('/api/geofences/bulk', async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+//query for clearning trucks except city logistics geofence
+    try {
+  await client.query(
+    'UPDATE geofences SET trucks = $1 WHERE id != $2',
+    [[], 51]
+  );
+  console.log("Cleared trucks for all geofences except ID 51");
+} catch (err) {
+  console.error("Error clearing existing trucks before bulk import:", err);
+  throw err;
+}
 
     const createdGeofences = [];
     const updatedGeofences = [];
