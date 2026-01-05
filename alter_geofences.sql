@@ -19,3 +19,19 @@ CREATE TRIGGER trigger_set_centre_point
 
 -- Update existing rows to populate centre_point
 UPDATE geofences SET centre_point = ST_GeogFromText('POINT(' || lng || ' ' || lat || ')') WHERE centre_point IS NULL;
+
+-- Create geofence references table
+CREATE TABLE IF NOT EXISTS switch_geofences_references (
+    id SERIAL PRIMARY KEY,
+    incoming_name VARCHAR(255) NOT NULL UNIQUE,
+    outgoing_name VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create trigger for updating updated_at on references table
+DROP TRIGGER IF EXISTS update_geofence_references_updated_at ON switch_geofences_references;
+CREATE TRIGGER update_geofence_references_updated_at
+    BEFORE UPDATE ON switch_geofences_references
+    FOR EACH ROW
+    EXECUTE FUNCTION update_updated_at_column();
