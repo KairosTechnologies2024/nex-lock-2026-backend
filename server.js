@@ -23,6 +23,18 @@ const pool = new Pool({
   password: process.env.DB_PASSWORD,
 });
 
+// Shared in-memory objects for vehicle lock functionality
+const lockStatusMap = {};
+
+
+
+
+
+
+
+
+
+
 
 pool.on('connect', () => {
   console.log('Connected to PostgreSQL database');
@@ -168,6 +180,128 @@ const mqttClient = mqtt.connect("mqtt://ekco-tracking.co.za:1883", {
     password: "dzRND6ZqiI"
 });
 
+// ---------------- MQTT lock ---------------- //
+const lockVehicle = async (req, res) => {
+    const { serial_number, status } = req.body;
+    if (!serial_number || typeof status !== "number") {
+        return res.status(400).json({ error: "Missing or invalid parameters." });
+    }
+    const topic = `ekco/v1/${serial_number}/lock/control`;
+    const secondTopic = `ekco/${serial_number}/custom/v1/lockControl`;
+    const payload = `${status}`;
+    const mqttOptions = {
+        username: process.env.MQTT_USERNAME || "dev:ekcoFleets",
+        password: process.env.MQTT_PASSWORD || "dzRND6ZqiI",
+        reconnectPeriod: 0
+    };
+    const client = mqtt.connect("mqtt://ekco-tracking.co.za:1883", mqttOptions);
+    let responded = false;
+    let publishCount = 0;
+    let errors = [];
+    client.on("connect", () => {
+        const handlePublish = (err, topicName) => {
+            publishCount++;
+            if (err) {
+                errors.push({ topic: topicName, error: err.message });
+            }
+            if (publishCount === 2) {
+                if (!responded) {
+                    responded = true;
+                    if (errors.length > 0) {
+                        console.error("MQTT publish errors:", errors);
+                        res.status(500).json({ error: "Failed to publish to MQTT topics", details: errors });
+                    } else {
+                        lockStatusMap[serial_number] = status;
+                        pool.query(
+                            'INSERT INTO vehicle_lock_status (serial_number, status) VALUES ($1, $2) ON CONFLICT (serial_number) DO UPDATE SET status = EXCLUDED.status',
+                            [serial_number, status]
+                        ).catch(dbErr => {
+                            console.error('Failed to persist lock status from API:', dbErr);
+                        });
+                        res.json({ message: "Command sent successfully", topics: [topic, secondTopic], payload });
+                    }
+                    client.end();
+                }
+            }
+        };
+        client.publish(topic, payload, { retain: false }, (err) => handlePublish(err, topic));
+        client.publish(secondTopic, payload, { retain: false }, (err) => handlePublish(err, secondTopic));
+    });
+    client.on("error", (err) => {
+        if (!responded) {
+            responded = true;
+            console.error("MQTT connection error:", err);
+            res.status(500).json({ error: "MQTT connection failed", details: err.message });
+        }
+        client.end();
+    });
+};
+
+const getLockStatus = async (req, res) => {
+    const { serial_number } = req.params;
+    try {
+        const result = await pool.query(
+            'SELECT status FROM vehicle_lock_status WHERE serial_number = $1',
+            [serial_number]
+        );
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "No status found for this vehicle." });
+        }
+        res.json({ status: result.rows[0].status });
+    } catch (err) {
+        res.status(500).json({ error: "Database error", details: err.message });
+    }
+};
+
+const deviceReset = async (req, res) => {
+    const { serial_number, status } = req.body;
+    if (!serial_number || typeof status !== "number") {
+        return res.status(400).json({ error: "Missing or invalid parameters." });
+    }
+    const topic = `ekco/v1/${serial_number}/device/reset`;
+    const secondTopic = `ekco/${serial_number}/custom/v1/deviceReset`;
+    const payload = `${status}`;
+    const mqttOptions = {
+        username: "dev:ekcoFleets",
+        password: "dzRND6ZqiI",
+        reconnectPeriod: 0
+    };
+    const client = mqtt.connect("mqtt://ekco-tracking.co.za:1883", mqttOptions);
+    let responded = false;
+    let publishCount = 0;
+    let errors = [];
+    client.on("connect", () => {
+        const handlePublish = (err, topicName) => {
+            publishCount++;
+            if (err) {
+                errors.push({ topic: topicName, error: err.message });
+            }
+            if (publishCount === 2) {
+                if (!responded) {
+                    responded = true;
+                    if (errors.length > 0) {
+                        console.error("MQTT publish errors:", errors);
+                        res.status(500).json({ error: "Failed to publish to MQTT topics", details: errors });
+                    } else {
+                        res.json({ message: "Command sent successfully", topics: [topic, secondTopic], payload });
+                    }
+                    client.end();
+                }
+            }
+        };
+        client.publish(topic, payload, { retain: false }, (err) => handlePublish(err, topic));
+        client.publish(secondTopic, payload, { retain: false }, (err) => handlePublish(err, secondTopic));
+    });
+    client.on("error", (err) => {
+        if (!responded) {
+            responded = true;
+            console.error("MQTT connection error:", err);
+            res.status(500).json({ error: "MQTT connection failed", details: err.message });
+        }
+        client.end();
+    });
+};
+
 
 mqttClient.on("connect", () => {
     console.log("✅ MQTT backend connected");
@@ -207,6 +341,21 @@ mqttClient.on("message", async (topic, message) => {
         }
     }
 });
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 // Function to send geofence update to all relevant serials
 async function sendGeofenceUpdate(serials = null) {
@@ -248,7 +397,26 @@ async function sendGeofenceUpdate(serials = null) {
 }
 
 
-
+app.get('/api/alerts/lock-stats', async (req, res)=>{
+  try {
+         const result = await pool.query(`
+             SELECT
+                 a.time,
+                 a.device_serial,
+                 a.alert,
+                 COALESCE(vi.fleet_number, vi.vehicle_reg, 'Unknown Fleet') as fleet
+             FROM alert_ts a
+             LEFT JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+             WHERE a.alert IN ('LOCKED', 'UNLOCKED', 'LOCK JAMMED !', 'LOCK JAM !')
+                 AND vi.company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
+             ORDER BY a.time DESC
+         `);
+         console.log('lock stats alerts:', result.rows.length)
+         res.json(result.rows);
+     } catch (err) {
+         res.status(500).json({ error: "Database error", details: err.message });
+     }
+ });
 
 
 app.get('/api/geofences', async (req, res) => {
@@ -1266,7 +1434,7 @@ app.get('/api/geofence-alerts', async (req, res) => {
 
 app.get('/api/trucks', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM vehicle_info order by id');
+    const result = await pool.query("SELECT * FROM vehicle_info WHERE company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555' ORDER BY id");
     res.json(result.rows);
   } catch (error) {
     console.error('Error fetching trucks:', error);
@@ -1274,18 +1442,287 @@ app.get('/api/trucks', async (req, res) => {
   }
 });
 
+app.get('/api/trucks/:device_serial', async (req, res) => {
+  try {
+    const { device_serial } = req.params;
+    const result = await pool.query(
+      "SELECT * FROM vehicle_info WHERE device_serial = $1 AND company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'",
+      [device_serial]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Error fetching vehicle:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/trucks/:device_serial/alerts', async (req, res) => {
+  try {
+    const { device_serial } = req.params;
+    const { limit = 50 } = req.query;
+
+    // Verify the vehicle exists and belongs to the company
+    const vehicleResult = await pool.query(
+      "SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'",
+      [device_serial]
+    );
+
+    if (vehicleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    // Get alerts for this vehicle
+    const alertsResult = await pool.query(
+      `SELECT a.*
+       FROM alert_ts a
+       WHERE a.device_serial::text = $1
+       ORDER BY a.time DESC
+       LIMIT $2`,
+      [device_serial, parseInt(limit)]
+    );
+
+    res.json(alertsResult.rows);
+  } catch (error) {
+    console.error('Error fetching vehicle alerts:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/trucks/:device_serial/trips', async (req, res) => {
+  try {
+    const { device_serial } = req.params;
+    const { start, end, limit = 20 } = req.query;
+
+    // First check if vehicle exists
+    const vehicleResult = await pool.query(
+      "SELECT * FROM vehicle_info WHERE device_serial = $1 AND company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'",
+      [device_serial]
+    );
+
+    if (vehicleResult.rows.length === 0) {
+      return res.status(404).json({ error: 'Vehicle not found' });
+    }
+
+    let query;
+    let params = [device_serial];
+
+    if (start && end) {
+      // Get trip data between specific dates
+      query = `
+        SELECT
+          gps.device_serial,
+          ST_AsText(gps.location) as location,
+          gps.speed,
+          gps.time,
+          CONCAT(v.vehicle_name, ' ', v.vehicle_model, ' ', v.vehicle_year) AS vehicle_full_name
+        FROM gps_ts gps
+        LEFT JOIN vehicle_info v ON gps.device_serial::text = v.device_serial
+        WHERE gps.device_serial = $1::bigint
+          AND gps.time >= EXTRACT(EPOCH FROM $2::timestamp)
+          AND gps.time <= EXTRACT(EPOCH FROM $3::timestamp)
+        ORDER BY gps.time ASC
+      `;
+      params = [device_serial, start, end];
+    } else {
+      // Get latest trips (last 30 days by default)
+      const thirtyDaysAgo = new Date();
+      thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+
+      query = `
+        SELECT
+          gps.device_serial,
+          ST_AsText(gps.location) as location,
+          gps.speed,
+          gps.time,
+          CONCAT(v.vehicle_name, ' ', v.vehicle_model, ' ', v.vehicle_year) AS vehicle_full_name
+        FROM gps_ts gps
+        LEFT JOIN vehicle_info v ON gps.device_serial::text = v.device_serial
+        WHERE gps.device_serial = $1::bigint
+          AND gps.time >= EXTRACT(EPOCH FROM $2::timestamp)
+        ORDER BY gps.time DESC
+        LIMIT $3
+      `;
+      params = [device_serial, thirtyDaysAgo.toISOString(), parseInt(limit)];
+    }
+
+    const result = await pool.query(query, params);
+
+    // Process the GPS data to extract lat/lng and group into trips
+    const gpsPoints = result.rows.map(row => {
+      const match = row.location.match(/POINT\(([^ ]+) ([^)]+)\)/);
+      if (match) {
+        return {
+          device_serial: row.device_serial,
+          lat: parseFloat(match[2]),
+          lng: parseFloat(match[1]),
+          speed: row.speed,
+          time: row.time,
+          vehicle_full_name: row.vehicle_full_name
+        };
+      }
+      return null;
+    }).filter(point => point !== null);
+
+    // Group GPS points into trips based on time gaps and speed
+    const trips = [];
+    let currentTrip = null;
+    let tripId = 1;
+
+    for (const point of gpsPoints) {
+      const pointTime = new Date(point.time * 1000);
+
+      if (!currentTrip) {
+        // Start new trip
+        currentTrip = {
+          id: tripId++,
+          start_time: pointTime.toISOString(),
+          end_time: pointTime.toISOString(),
+          points: [point],
+          max_speed: point.speed,
+          total_distance: 0,
+          start_lat: point.lat,
+          start_lng: point.lng,
+          end_lat: point.lat,
+          end_lng: point.lng
+        };
+      } else {
+        const timeDiff = pointTime.getTime() - new Date(currentTrip.end_time).getTime();
+        const isNewTrip = timeDiff > (2 * 60 * 60 * 1000); // 2 hours gap = new trip
+
+        if (isNewTrip) {
+          // Finalize current trip
+          trips.push({
+            id: currentTrip.id,
+            start_time: currentTrip.start_time,
+            end_time: currentTrip.end_time,
+            distance_km: Math.round(currentTrip.total_distance * 100) / 100,
+            max_speed: Math.round(currentTrip.max_speed),
+            average_speed: Math.round(currentTrip.points.reduce((sum, p) => sum + p.speed, 0) / currentTrip.points.length),
+            fuel_consumed: Math.round(currentTrip.total_distance * 0.08), // Rough estimate: 8L per 100km
+            start_location: `${currentTrip.start_lat.toFixed(4)}, ${currentTrip.start_lng.toFixed(4)}`,
+            end_location: `${currentTrip.end_lat.toFixed(4)}, ${currentTrip.end_lng.toFixed(4)}`,
+            points: currentTrip.points
+          });
+
+          // Start new trip
+          currentTrip = {
+            id: tripId++,
+            start_time: pointTime.toISOString(),
+            end_time: pointTime.toISOString(),
+            points: [point],
+            max_speed: point.speed,
+            total_distance: 0,
+            start_lat: point.lat,
+            start_lng: point.lng,
+            end_lat: point.lat,
+            end_lng: point.lng
+          };
+        } else {
+          // Continue current trip
+          currentTrip.end_time = pointTime.toISOString();
+          currentTrip.end_lat = point.lat;
+          currentTrip.end_lng = point.lng;
+          currentTrip.max_speed = Math.max(currentTrip.max_speed, point.speed);
+
+          // Calculate distance from last point (rough calculation)
+          const lastPoint = currentTrip.points[currentTrip.points.length - 1];
+          const distance = Math.sqrt(
+            Math.pow(point.lat - lastPoint.lat, 2) + Math.pow(point.lng - lastPoint.lng, 2)
+          ) * 111; // Rough km conversion
+          currentTrip.total_distance += distance;
+
+          currentTrip.points.push(point);
+        }
+      }
+    }
+
+    // Add the last trip if it exists
+    if (currentTrip && currentTrip.points.length > 1) {
+      trips.push({
+        id: currentTrip.id,
+        start_time: currentTrip.start_time,
+        end_time: currentTrip.end_time,
+        distance_km: Math.round(currentTrip.total_distance * 100) / 100,
+        max_speed: Math.round(currentTrip.max_speed),
+        average_speed: Math.round(currentTrip.points.reduce((sum, p) => sum + p.speed, 0) / currentTrip.points.length),
+        fuel_consumed: Math.round(currentTrip.total_distance * 0.08),
+        start_location: `${currentTrip.start_lat.toFixed(4)}, ${currentTrip.start_lng.toFixed(4)}`,
+        end_location: `${currentTrip.end_lat.toFixed(4)}, ${currentTrip.end_lng.toFixed(4)}`,
+        points: currentTrip.points
+      });
+    }
+
+    res.json(trips.reverse()); // Return most recent trips first
+  } catch (error) {
+    console.error('Error fetching vehicle trips:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/ignitionStatus', async (req, res) => {
+  try {
+    // Check if a specific serial is requested
+    const { serial } = req.query;
+
+    let query;
+    let params;
+
+    if (serial) {
+      // Fetch ignition status for a specific device serial
+      query = `
+        SELECT * FROM engine_ts
+        WHERE device_serial = $1::bigint
+        AND device_serial::text IN (
+          SELECT device_serial
+          FROM vehicle_info
+          WHERE company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
+        )
+        ORDER BY time DESC
+        LIMIT 1
+      `;
+      params = [serial];
+    } else {
+      // Fetch latest ignition status for all devices from the company
+      query = `
+        SELECT DISTINCT ON (device_serial) *
+        FROM engine_ts
+        WHERE device_serial::text IN (
+          SELECT device_serial
+          FROM vehicle_info
+          WHERE company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
+        )
+        ORDER BY device_serial, time DESC
+      `;
+      params = [];
+    }
+
+    const result = await pool.query(query, params);
+    console.log('Ignition Status API response:', result.rows.length, 'records', serial ? `for serial ${serial}` : 'for all devices');
+    res.json(result.rows);
+  } catch (err) {
+    console.error('Error fetching ignition status:', err);
+    res.status(500).json({ error: "Database error", details: err.message });
+  }
+});
 
 app.get('/api/alerts/latest200', async (req, res)=>{
 
 
  try {
         const result = await pool.query(`
-            SELECT * 
-            FROM alert_ts 
-            ORDER BY time DESC 
+            SELECT a.*
+            FROM alert_ts a
+            INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+            WHERE vi.company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
+            ORDER BY a.time DESC
             LIMIT 200
         `);
-        console.log('latest 200 ', result.rows)
+        console.log('latest 200 filtered by company', result.rows.length)
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -1298,11 +1735,13 @@ app.get('/api/alerts/latest', async (req, res)=>{
 
  try {
         const result = await pool.query(`
-            SELECT DISTINCT ON (device_serial) *
-            FROM alert_ts
-            ORDER BY device_serial, time DESC
+            SELECT DISTINCT ON (a.device_serial) a.*
+            FROM alert_ts a
+            INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+            WHERE vi.company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
+            ORDER BY a.device_serial, a.time DESC
         `);
-        console.log(result.rows)
+        console.log('latest alerts filtered by company', result.rows.length)
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -1359,6 +1798,111 @@ app.use(express.static(path.join(__dirname, '/client/dist'), {
     }
   }
 }));
+
+// Vehicle Lock Control Routes - Unified endpoint to match old app
+app.post('/api/lockVehicle', async (req, res) => {
+  try {
+    await lockVehicle(req, res);
+  } catch (error) {
+    console.error('Lock vehicle error:', error);
+    res.status(500).json({ error: 'Failed to control vehicle lock' });
+  }
+});
+
+app.get('/api/lock-status/:serial_number', async (req, res) => {
+  try {
+    await getLockStatus(req, res);
+  } catch (error) {
+    console.error('Lock status error:', error);
+    res.status(500).json({ error: 'Failed to get lock status' });
+  }
+});
+
+// Trip reports endpoint - returns multiple trip reports with GPS paths
+app.get('/api/trips/:device_serial', async (req, res) => {
+  const { device_serial } = req.params;
+  const { start, end } = req.query;
+  try {
+      let query = "SELECT * FROM trips WHERE device_serial = $1";
+      let params = [device_serial];
+
+      if (start && end) {
+          query += " AND start_time >= EXTRACT(EPOCH FROM $2::timestamp) AND end_time <= EXTRACT(EPOCH FROM $3::timestamp)";
+          params = [device_serial, start, end];
+      }
+
+      query += " ORDER BY start_time DESC";
+
+      const tripsResult = await pool.query(query, params);
+      const tripsWithPath = await Promise.all(
+          tripsResult.rows.map(async (trip) => {
+              const pathResult = await pool.query(
+                  `SELECT
+                    time,
+                    ST_X(location::geometry) AS longitude,
+                    ST_Y(location::geometry) AS latitude,
+                    speed
+                  FROM gps_ts
+                  WHERE device_serial = $1
+                    AND time BETWEEN $2 AND $3
+                  ORDER BY time`,
+                  [device_serial, trip.start_time, trip.end_time]
+              );
+              return {
+                  ...trip,
+                  path: pathResult.rows,
+              };
+          })
+      );
+      res.json(tripsWithPath);
+  } catch (err) {
+      res.status(500).json({ error: "Database error", details: err.message });
+  }
+});
+
+// Helper function to calculate distance from WKB path points
+function calculateDistance(path) {
+  if (!path || path.length < 2) return 0;
+
+  let totalDistance = 0;
+
+  for (let i = 1; i < path.length; i++) {
+    const point1 = parseWKBPoint(path[i-1]);
+    const point2 = parseWKBPoint(path[i]);
+
+    if (point1 && point2) {
+      const distance = getDistance(point1.lat, point1.lng, point2.lat, point2.lng);
+      totalDistance += distance;
+    }
+  }
+
+  return Math.round(totalDistance * 100) / 100; // Round to 2 decimal places
+}
+
+// Helper function to parse WKB POINT string
+function parseWKBPoint(wkbString) {
+  const match = wkbString.match(/POINT\(([^ ]+) ([^)]+)\)/);
+  if (match) {
+    return {
+      lng: parseFloat(match[1]),
+      lat: parseFloat(match[2])
+    };
+  }
+  return null;
+}
+
+// Helper function to calculate distance between two lat/lng points in km
+function getDistance(lat1, lng1, lat2, lng2) {
+  const R = 6371; // Earth's radius in km
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLng/2) * Math.sin(dLng/2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
 //Render client
 //uodated client
 app.get('*', (req, res)=>{
@@ -1814,3 +2358,50 @@ async function normalizeTruckIdentifiers(client, truckInputs = []) {
 
   return { normalized: uniqueNormalized, missing: uniqueMissing };
 }
+
+// Geocoding endpoint for reverse geocoding addresses
+app.get('/api/geocode/reverse', async (req, res) => {
+  try {
+    const { lat, lng } = req.query;
+
+    if (!lat || !lng) {
+      return res.status(400).json({ error: 'Latitude and longitude are required' });
+    }
+
+    const latNum = parseFloat(lat);
+    const lngNum = parseFloat(lng);
+
+    if (isNaN(latNum) || isNaN(lngNum)) {
+      return res.status(400).json({ error: 'Invalid latitude or longitude' });
+    }
+
+    // Use Google Maps Geocoding API
+    const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: 'Google Maps API key not configured' });
+    }
+
+    const geocodeUrl = `https://maps.googleapis.com/maps/api/geocode/json?latlng=${latNum},${lngNum}&key=${apiKey}`;
+
+    const response = await fetch(geocodeUrl);
+    const data = await response.json();
+
+    if (data.status === 'OK' && data.results && data.results.length > 0) {
+      const result = data.results[0];
+      res.json({
+        address: result.formatted_address,
+        place_id: result.place_id,
+        location: {
+          lat: latNum,
+          lng: lngNum
+        },
+        components: result.address_components
+      });
+    } else {
+      res.status(404).json({ error: 'No address found for these coordinates' });
+    }
+  } catch (error) {
+    console.error('Geocoding error:', error);
+    res.status(500).json({ error: 'Geocoding service error' });
+  }
+});
