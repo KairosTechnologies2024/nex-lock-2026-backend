@@ -46,8 +46,8 @@ const pool = new Pool({
   keepAlive: true,            // Keep connections alive
   keepAliveInitialDelayMillis: 0,
 
-  // SSL (if needed)
-  ssl: process.env.NODE_ENV === 'production' ? true : false
+  // SSL disabled for Netcup PostgreSQL
+  ssl: false
 });
 
 // Shared in-memory objects for vehicle lock functionality
