@@ -10,6 +10,11 @@ const mimeTypes = require('mime-types');
 const WebSocket = require('ws');
 const authController = require('./controllers/auth/nex super users/nex_auth_supers_controller');
 const authRoutes= require('./routes/nex_auth_routes');
+const deviceHealthRoutes = require('./routes/deviceHealthRoutes');
+
+// Declare WebSocket server at module level
+let wss;
+
 // Middleware
 app.use(cors());
 app.use(express.json({ limit: '900mb' }));
@@ -21,6 +26,28 @@ const pool = new Pool({
   database: process.env.DB_NAME,
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
+
+  // Connection limits
+  max: 20,                    // Maximum connections in pool
+  min: 2,                     // Minimum connections to maintain
+
+  // Idle connection management (CRITICAL for preventing locks)
+  idleTimeoutMillis: 30000,   // Close idle connections after 30 seconds
+  connectionTimeoutMillis: 2000, // Timeout acquiring connection from pool
+
+  // Query timeouts (prevents long-running queries that cause locks)
+  query_timeout: 30000,       // 30 second query timeout
+  statement_timeout: 30000,   // 30 second statement timeout
+
+  // Connection validation
+  allowExitOnIdle: true,      // Allow pool to close when idle
+
+  // Retry and cleanup
+  keepAlive: true,            // Keep connections alive
+  keepAliveInitialDelayMillis: 0,
+
+  // SSL (if needed)
+  ssl: process.env.NODE_ENV === 'production' ? true : false
 });
 
 // Shared in-memory objects for vehicle lock functionality
@@ -44,6 +71,15 @@ pool.on('error', (err) => {
   console.error('Unexpected error on idle client', err);
   process.exit(-1);
 });
+
+// Monitor pool health every 30 seconds
+setInterval(() => {
+  console.log('🔍 Pool stats:', {
+    totalCount: pool.totalCount,
+    idleCount: pool.idleCount,
+    waitingCount: pool.waitingCount
+  });
+}, 30000);
 
 async function ensureGeofencePolygonColumns() {
   try {
@@ -150,9 +186,67 @@ async function ensureGeofenceReferencesV2Table() {
   }
 }
 
-ensureGeofencePolygonColumns();
-ensureGeofenceReferencesTable();
-ensureGeofenceReferencesV2Table();
+async function initializeDatabase() {
+  try {
+    await ensureGeofencePolygonColumns();
+    await ensureGeofenceReferencesTable();
+    await ensureGeofenceReferencesV2Table();
+    console.log('✅ Database initialization completed');
+  } catch (error) {
+    console.error('❌ Database initialization failed:', error);
+    process.exit(1);
+  }
+}
+
+// Initialize database and start server
+async function startServer() {
+  try {
+    await initializeDatabase();
+
+    // Start server only after database initialization
+    const server = app.listen(port, () => {
+      console.log(`Server running on port ${port}`);
+    });
+
+    // Initialize WebSocket server (assigned to module-level variable)
+    wss = new WebSocket.Server({ server });
+
+    wss.on('connection', (ws) => {
+      console.log('New WebSocket connection');
+
+      ws.on('message', (message) => {
+        console.log('Received:', message);
+      });
+
+      ws.on('close', () => {
+        console.log('WebSocket connection closed');
+      });
+    });
+
+// Declare WebSocket server at module level
+
+function broadcast(data) {
+  if (!wss) {
+    console.warn('WebSocket server not initialized yet');
+    return;
+  }
+  const message = JSON.stringify(data);
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+    } else {
+      console.log("Client not open:", client.readyState);
+    }
+  });
+}
+
+  } catch (error) {
+    console.error('❌ Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
 
 
 
@@ -322,9 +416,18 @@ mqttClient.on("connect", () => {
         }
     });
 
+    // Subscribe to logs topic
+    mqttClient.subscribe("ekco/v1/+/logs/data", (err) => {
+        if (err) {
+            console.error("❌ Failed to subscribe to logs/data:", err);
+        } else {
+            console.log("✅ Subscribed to all vehicle logs/data topics");
+        }
+    });
+
 });
 
-// MQTT message handler - broadcast immediately for real-time alerts
+// MQTT message handler - broadcast immediately for real-time alerts and logs
 mqttClient.on("message", async (topic, message) => {
     if (topic.includes("geofenceAlert")) {
         try {
@@ -338,6 +441,43 @@ mqttClient.on("message", async (topic, message) => {
             }
         } catch (error) {
             console.error("❌ Error processing MQTT geofence alert:", error);
+        }
+    } else if (topic.includes("logs/data")) {
+        const payload = message.toString();
+        console.log(`[MQTT LOGS] Received on topic: ${topic} | payload: ${payload}`);
+
+        const matchLogs = topic.match(/^ekco\/v1\/(.+)\/logs\/data$/);
+        if (matchLogs) {
+            const serial = matchLogs[1];
+            console.log(`[MQTT LOGS] Matched serial: ${serial}`);
+
+            if (!logsMap[serial]) logsMap[serial] = [];
+            const logEntry = {
+                timestamp: Date.now(),
+                data: payload
+            };
+            logsMap[serial].push(logEntry);
+            // Optionally limit log size per device
+            if (logsMap[serial].length > 1000) logsMap[serial].shift();
+
+            // Stream to active SSE clients for logs
+            console.log(`[MQTT LOGS] Checking activeStreams for serial ${serial}:`, !!activeStreams[serial]);
+            if (activeStreams[serial] && activeStreams[serial].logs) {
+                console.log(`[MQTT LOGS] Found ${activeStreams[serial].logs.length} active SSE clients for serial ${serial}`);
+                activeStreams[serial].logs.forEach((res, index) => {
+                    try {
+                        const dataToSend = `data: ${JSON.stringify({ topic, payload })}\n\n`;
+                        console.log(`[MQTT LOGS] Sending to client ${index}: ${dataToSend.substring(0, 100)}...`);
+                        res.write(dataToSend);
+                    } catch (writeError) {
+                        console.error(`[MQTT LOGS] Error writing to SSE client ${index}:`, writeError);
+                    }
+                });
+            } else {
+                console.log(`[MQTT LOGS] No active SSE streams found for serial ${serial}`);
+            }
+        } else {
+            console.log(`[MQTT LOGS] Topic ${topic} did not match expected pattern`);
         }
     }
 });
@@ -1758,6 +1898,42 @@ app.get('/api/alerts/latest', async (req, res)=>{
 
 
 
+// Test route to simulate MQTT logs message for debugging
+app.get('/test-logs/:serial', (req, res) => {
+  const { serial } = req.params;
+  const testTopic = `ekco/v1/${serial}/logs/data`;
+  const testPayload = `Test log message from server at ${new Date().toISOString()}`;
+
+  console.log(`[TEST] Simulating MQTT logs message for serial ${serial}`);
+
+  // Simulate what the MQTT handler does
+  const matchLogs = testTopic.match(/^ekco\/v1\/(.+)\/logs\/data$/);
+  if (matchLogs) {
+    const serialNum = matchLogs[1];
+    console.log(`[TEST] Matched serial: ${serialNum}`);
+
+    if (activeStreams[serialNum] && activeStreams[serialNum].logs) {
+      console.log(`[TEST] Found ${activeStreams[serialNum].logs.length} active SSE clients for serial ${serialNum}`);
+      activeStreams[serialNum].logs.forEach((resStream, index) => {
+        try {
+          const dataToSend = `data: ${JSON.stringify({ topic: testTopic, payload: testPayload })}\n\n`;
+          console.log(`[TEST] Sending to client ${index}: ${dataToSend.substring(0, 100)}...`);
+          resStream.write(dataToSend);
+          console.log(`[TEST] Successfully sent test log to SSE client ${index}`);
+        } catch (writeError) {
+          console.error(`[TEST] Error writing to SSE client ${index}:`, writeError);
+        }
+      });
+      res.send(`Test logs message sent to ${activeStreams[serialNum].logs.length} SSE clients for serial ${serial}`);
+    } else {
+      console.log(`[TEST] No active SSE streams found for serial ${serialNum}`);
+      res.send(`No active SSE streams found for serial ${serial}. Make sure the DeviceLogs component is connected first.`);
+    }
+  } else {
+    res.send(`Invalid topic format for serial ${serial}`);
+  }
+});
+
 // Test route to trigger WebSocket broadcast for logging verification
 app.get('/test-broadcast', (req, res) => {
   const testAlerts = [
@@ -1787,6 +1963,7 @@ function generateRandomColor() {
 
 // Auth routes (including customers)
 app.use('/api', authRoutes);
+app.use('/api', deviceHealthRoutes);
 
 //Use the client app
 app.use(express.static(path.join(__dirname, '/client/dist'), {
@@ -1905,10 +2082,6 @@ function getDistance(lat1, lng1, lat2, lng2) {
 
 //Render client
 //uodated client
-app.get('*', (req, res)=>{
-
-    res.sendFile(path.join(__dirname,'/client/dist/index.html'))
-})
 
 
 
@@ -1919,36 +2092,96 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: 'Something went wrong!' });
 });
 
-// Start server
-const server = app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+// ---------------- MQTT Logs Functionality ---------------- //
 
-// WebSocket server
-const wss = new WebSocket.Server({ server });
+// In-memory log storage: { serial_number: [serial1, log2, ...] }
+const logsMap = {};
 
-wss.on('connection', (ws) => {
-  console.log('New WebSocket connection');
+// Track active SSE streams per serial_number
+const activeStreams = {};
 
-  ws.on('message', (message) => {
-    console.log('Received:', message);
+
+
+// Track active retrieve/stream connections (now handled by activeStreams)
+
+app.get('/logs/:serial_number/retrieve/stream', (req, res) => {
+  const { serial_number } = req.params;
+  const command = "1";
+  const controlTopic = `ekco/v1/${serial_number}/logs/control`;
+
+  console.log(`[SSE] Setting up stream for serial: ${serial_number}`);
+
+  req.socket.setTimeout(0);
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+  res.flushHeaders();
+
+  // Set up activeStreams for the global MQTT handler to use
+  if (!activeStreams[serial_number]) {
+    activeStreams[serial_number] = { logs: [] };
+  }
+  activeStreams[serial_number].logs.push(res);
+  console.log(`[SSE] Added SSE client for serial ${serial_number}. Total clients: ${activeStreams[serial_number].logs.length}`);
+
+  mqttClient.publish(controlTopic, String(command), { retain: false }, (err) => {
+    if (err) {
+      console.error(`[SSE] Failed to publish control command to ${controlTopic}:`, err);
+      res.write(`event: error\ndata: ${JSON.stringify({ error: 'Failed to publish control command', details: err.message })}\n\n`);
+      res.end();
+      // Remove from activeStreams
+      if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
+        activeStreams[serial_number].logs = activeStreams[serial_number].logs.filter(r => r !== res);
+      }
+    } else {
+      console.log(`[SSE] Successfully published start command to ${controlTopic}`);
+      // Send a connection confirmation message
+      res.write(`data: ${JSON.stringify({ topic: 'connection', payload: 'SSE connection established for serial ' + serial_number })}\n\n`);
+    }
   });
 
-  ws.on('close', () => {
-    console.log('WebSocket connection closed');
+  req.on('close', () => {
+    console.log(`[SSE] SSE connection closed for serial ${serial_number}`);
+    // Remove from activeStreams when connection closes
+    if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
+      activeStreams[serial_number].logs = activeStreams[serial_number].logs.filter(r => r !== res);
+      console.log(`[SSE] Removed SSE client for serial ${serial_number}. Remaining clients: ${activeStreams[serial_number].logs.length}`);
+    }
   });
 });
 
-function broadcast(data) {
-    const message = JSON.stringify(data);
-    wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-            client.send(message);
-        } else {
-            console.log("Client not open:", client.readyState);
-        }
+app.post('/logs/:serial_number/retrieve/stream/stop', (req, res) => {
+  const { serial_number } = req.params;
+  const controlTopic = `ekco/v1/${serial_number}/logs/control`;
+
+  mqttClient.publish(controlTopic, "0", { retain: false }, (err) => {
+    if (err) {
+      console.error(`Failed to send stop command to ${controlTopic}:`, err);
+    }
+  });
+
+  // Close all active SSE streams for this serial
+  if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
+    activeStreams[serial_number].logs.forEach(streamRes => {
+      streamRes.write('event: end\ndata: Stream stopped by server\n\n');
+      streamRes.end();
     });
-}
+    activeStreams[serial_number].logs = [];
+  }
+
+  // Always 200 OK
+  res.json({ message: `Stop command sent for ${serial_number}` });
+});
+
+//Render client
+//uodated client
+app.get('*', (req, res)=>{
+    res.sendFile(path.join(__dirname,'/client/dist/index.html'))
+});
+
+// Server and WebSocket setup moved to startServer() function above
 
 
 
@@ -2113,6 +2346,10 @@ async function fetchLiveTrucks() {
 
 // Function to broadcast live trucks to all WebSocket clients
 function broadcastLiveTrucks(trucks) {
+  if (!wss) {
+    console.warn('WebSocket server not initialized yet');
+    return;
+  }
   const message = JSON.stringify({
     type: 'live-trucks',
     data: trucks
@@ -2306,12 +2543,40 @@ async function fetchAndBroadcastLiveTrucks() {
 setInterval(fetchAndBroadcastLiveTrucks, 1000);
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+const gracefulShutdown = async () => {
   console.log('Shutting down gracefully...');
-  pool.end(() => {
-    console.log('Database connection closed.');
-    process.exit(0);
-  });
+
+  try {
+    // Close database pool with timeout
+    await Promise.race([
+      pool.end(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error('Pool end timeout')), 5000)
+      )
+    ]);
+    console.log('Database connections closed successfully.');
+  } catch (err) {
+    console.error('Error closing database connections:', err.message);
+    // Force close anyway
+    pool.end(() => {});
+  }
+
+  process.exit(0);
+};
+
+// Handle multiple termination signals
+process.on('SIGINT', gracefulShutdown);
+process.on('SIGTERM', gracefulShutdown);
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  gracefulShutdown();
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  gracefulShutdown();
 });
 
 // Helper: normalize incoming truck identifiers to canonical device_serial values using vehicle_info.
