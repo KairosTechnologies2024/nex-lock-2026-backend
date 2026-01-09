@@ -313,6 +313,16 @@ const lockVehicle = async (req, res) => {
                             console.error('Failed to persist lock status from API:', dbErr);
                         });
                         res.json({ message: "Command sent successfully", topics: [topic, secondTopic], payload });
+
+                        // Broadcast lock status update via WebSocket for live updates
+                        broadcast({
+                            type: "lock_status_update",
+                            data: {
+                                device_serial: serial_number,
+                                lock_status: status === 1 ? 'LOCKED' : 'UNLOCKED',
+                                timestamp: Math.floor(Date.now() / 1000)
+                            }
+                        });
                     }
                     client.end();
                 }
