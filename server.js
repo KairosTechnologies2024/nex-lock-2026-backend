@@ -225,21 +225,6 @@ async function startServer() {
 
 // Declare WebSocket server at module level
 
-function broadcast(data) {
-  if (!wss) {
-    console.warn('WebSocket server not initialized yet');
-    return;
-  }
-  const message = JSON.stringify(data);
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(message);
-    } else {
-      console.log("Client not open:", client.readyState);
-    }
-  });
-}
-
   } catch (error) {
     console.error('❌ Failed to start server:', error);
     process.exit(1);
@@ -266,6 +251,21 @@ const calculatePolygonCentroid = (polygon) => {
 
 // ---------------- MQTT Reset ---------------- //
 
+// Global broadcast function (moved outside startServer for global access)
+function broadcast(data) {
+  if (!wss) {
+    console.warn('WebSocket server not initialized yet');
+    return;
+  }
+  const message = JSON.stringify(data);
+  wss.clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(message);
+    } else {
+      console.log("Client not open:", client.readyState);
+    }
+  });
+}
 
 // ---------------- MQTT Status Display ---------------- //
 
