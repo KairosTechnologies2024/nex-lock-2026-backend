@@ -3,6 +3,7 @@ const cors = require('cors');
 const { Pool } = require('pg');
 require('dotenv').config();
 const path= require('path');
+const jwt = require('jsonwebtoken');
 const app = express();
 const port = process.env.PORT || 3001;
 const mqtt = require('mqtt');
@@ -12,12 +13,14 @@ const authController = require('./controllers/auth/nex super users/nex_auth_supe
 const authRoutes= require('./routes/nex_auth_routes');
 const deviceHealthRoutes = require('./routes/deviceHealthRoutes');
 
-// Declare WebSocket server at module level
+// WebSocket variable server at module level
 let wss;
 
 // Middleware
 app.use(cors());
-app.use(express.json({ limit: '900mb' }));
+app.use(express.json({ limit: '900mb'
+  
+ }));
 
 // Database connection
 const pool = new Pool({
@@ -53,14 +56,37 @@ const pool = new Pool({
 // Shared in-memory objects for vehicle lock functionality
 const lockStatusMap = {};
 
+// ---------------- Auth Middleware ---------------- //
+function authenticateRequest(req, res, next) {
+  try {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
+    if (!token) {
+      return res.status(401).json({ error: 'Authentication token missing' });
+    }
 
+    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+      if (err) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+      }
 
+      req.user = decoded;
+      console.log('Authenticated user:', req.user);
+      console.log('token:', token);
+      next();
+    });
+  } catch (err) {
+    console.error('Auth middleware error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
 
-
-
-
-
+// ---------------- MQTT Logs Functionality ---------------- //
+// In-memory log storage: { serial_number: [serial1, log2, ...] }
+const logsMap = {};
+// Track active SSE streams per serial_number
+const activeStreams = {};
 
 
 pool.on('connect', () => {
@@ -214,6 +240,13 @@ async function startServer() {
     wss.on('connection', (ws) => {
       console.log('New WebSocket connection');
 
+      // Add heartbeat mechanism
+      ws.isAlive = true;
+      ws.on('pong', () => {
+        ws.isAlive = true;
+        console.log('WebSocket pong received');
+      });
+
       ws.on('message', (message) => {
         console.log('Received:', message);
       });
@@ -221,7 +254,26 @@ async function startServer() {
       ws.on('close', () => {
         console.log('WebSocket connection closed');
       });
+
+      ws.on('error', (error) => {
+        console.error('WebSocket error:', error);
+      });
     });
+
+    // Implement server-side heartbeat every 30 seconds
+    setInterval(() => {
+      wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) {
+          console.log('Terminating inactive WebSocket connection');
+          return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping();
+      });
+    }, 30000);
+
+    // Start checking for geofence alerts now that WebSocket server is ready
+    setInterval(checkAndBroadcastNewGeofenceAlerts, 2000);
 
 // Declare WebSocket server at module level
 
@@ -547,7 +599,7 @@ async function sendGeofenceUpdate(serials = null) {
 }
 
 
-app.get('/api/alerts/lock-stats', async (req, res)=>{
+app.get('/api/alerts/lock-stats', authenticateRequest, async (req, res)=>{
   try {
          const result = await pool.query(`
              SELECT
@@ -558,7 +610,6 @@ app.get('/api/alerts/lock-stats', async (req, res)=>{
              FROM alert_ts a
              LEFT JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
              WHERE a.alert IN ('LOCKED', 'UNLOCKED', 'LOCK JAMMED !', 'LOCK JAM !')
-                 AND vi.company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
              ORDER BY a.time DESC
          `);
          console.log('lock stats alerts:', result.rows.length)
@@ -1582,9 +1633,11 @@ app.get('/api/geofence-alerts', async (req, res) => {
   }
 });
 
-app.get('/api/trucks', async (req, res) => {
+app.get('/api/trucks', authenticateRequest, async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM vehicle_info WHERE company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555' ORDER BY id");
+    const result = await pool.query(
+      'SELECT * FROM vehicle_info ORDER BY id'
+    );
     res.json(result.rows);
   } catch (error) {
     console.error('Error fetching trucks:', error);
@@ -1592,12 +1645,17 @@ app.get('/api/trucks', async (req, res) => {
   }
 });
 
-app.get('/api/trucks/:device_serial', async (req, res) => {
+app.get('/api/trucks/:device_serial', authenticateRequest, async (req, res) => {
   try {
     const { device_serial } = req.params;
+    const companyId = req.user?.company_id;
+    if (!companyId) {
+      return res.status(403).json({ error: 'No company assigned to user' });
+    }
+
     const result = await pool.query(
-      "SELECT * FROM vehicle_info WHERE device_serial = $1 AND company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'",
-      [device_serial]
+      'SELECT * FROM vehicle_info WHERE device_serial = $1 AND company_id = $2',
+      [device_serial, companyId]
     );
 
     if (result.rows.length === 0) {
@@ -1611,15 +1669,19 @@ app.get('/api/trucks/:device_serial', async (req, res) => {
   }
 });
 
-app.get('/api/trucks/:device_serial/alerts', async (req, res) => {
+app.get('/api/trucks/:device_serial/alerts', authenticateRequest, async (req, res) => {
   try {
     const { device_serial } = req.params;
     const { limit = 50 } = req.query;
+    const companyId = req.user?.company_id;
+    if (!companyId) {
+      return res.status(403).json({ error: 'No company assigned to user' });
+    }
 
     // Verify the vehicle exists and belongs to the company
     const vehicleResult = await pool.query(
-      "SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'",
-      [device_serial]
+      'SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND company_id = $2',
+      [device_serial, companyId]
     );
 
     if (vehicleResult.rows.length === 0) {
@@ -1643,15 +1705,19 @@ app.get('/api/trucks/:device_serial/alerts', async (req, res) => {
   }
 });
 
-app.get('/api/trucks/:device_serial/trips', async (req, res) => {
+app.get('/api/trucks/:device_serial/trips', authenticateRequest, async (req, res) => {
   try {
     const { device_serial } = req.params;
     const { start, end, limit = 20 } = req.query;
+    const companyId = req.user?.company_id;
+    if (!companyId) {
+      return res.status(403).json({ error: 'No company assigned to user' });
+    }
 
     // First check if vehicle exists
     const vehicleResult = await pool.query(
-      "SELECT * FROM vehicle_info WHERE device_serial = $1 AND company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'",
-      [device_serial]
+      'SELECT * FROM vehicle_info WHERE device_serial = $1 AND company_id = $2',
+      [device_serial, companyId]
     );
 
     if (vehicleResult.rows.length === 0) {
@@ -1814,7 +1880,7 @@ app.get('/api/trucks/:device_serial/trips', async (req, res) => {
   }
 });
 
-app.get('/api/ignitionStatus', async (req, res) => {
+app.get('/api/ignitionStatus', authenticateRequest, async (req, res) => {
   try {
     // Check if a specific serial is requested
     const { serial } = req.query;
@@ -1827,25 +1893,15 @@ app.get('/api/ignitionStatus', async (req, res) => {
       query = `
         SELECT * FROM engine_ts
         WHERE device_serial = $1::bigint
-        AND device_serial::text IN (
-          SELECT device_serial
-          FROM vehicle_info
-          WHERE company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
-        )
         ORDER BY time DESC
         LIMIT 1
       `;
       params = [serial];
     } else {
-      // Fetch latest ignition status for all devices from the company
+      // Fetch latest ignition status for all devices
       query = `
         SELECT DISTINCT ON (device_serial) *
         FROM engine_ts
-        WHERE device_serial::text IN (
-          SELECT device_serial
-          FROM vehicle_info
-          WHERE company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
-        )
         ORDER BY device_serial, time DESC
       `;
       params = [];
@@ -1860,44 +1916,34 @@ app.get('/api/ignitionStatus', async (req, res) => {
   }
 });
 
-app.get('/api/alerts/latest200', async (req, res)=>{
-
-
- try {
-        const result = await pool.query(`
-            SELECT a.*
-            FROM alert_ts a
-            INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
-            WHERE vi.company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
-            ORDER BY a.time DESC
-            LIMIT 200
-        `);
-        console.log('latest 200 filtered by company', result.rows.length)
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: "Database error", details: err.message });
-    }
-
-
+app.get('/api/alerts/latest200', authenticateRequest, async (req, res)=>{
+  try {
+    const result = await pool.query(`
+        SELECT a.*
+        FROM alert_ts a
+        INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+        ORDER BY a.time DESC
+        LIMIT 200
+    `);
+    console.log('latest 200 alerts', result.rows.length)
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: "Database error", details: err.message });
+  }
 });
-app.get('/api/alerts/latest', async (req, res)=>{
-
-
- try {
-        const result = await pool.query(`
-            SELECT DISTINCT ON (a.device_serial) a.*
-            FROM alert_ts a
-            INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
-            WHERE vi.company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
-            ORDER BY a.device_serial, a.time DESC
-        `);
-        console.log('latest alerts filtered by company', result.rows.length)
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: "Database error", details: err.message });
-    }
-
-
+app.get('/api/alerts/latest', authenticateRequest, async (req, res)=>{
+  try {
+    const result = await pool.query(`
+        SELECT DISTINCT ON (a.device_serial) a.*
+        FROM alert_ts a
+        INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+        ORDER BY a.device_serial, a.time DESC
+    `);
+    console.log('latest alerts', result.rows.length)
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: "Database error", details: err.message });
+  }
 });
 
 
@@ -1974,6 +2020,79 @@ function generateRandomColor() {
 // Auth routes (including customers)
 app.use('/api', authRoutes);
 app.use('/api', deviceHealthRoutes);
+
+// ---------------- MQTT Logs Routes ---------------- //
+
+app.get('/api/logs/:serial_number/retrieve/stream', (req, res) => {
+  const { serial_number } = req.params;
+  const command = "1";
+  const controlTopic = `ekco/v1/${serial_number}/logs/control`;
+
+  console.log(`[SSE] Setting up stream for serial: ${serial_number}`);
+
+  req.socket.setTimeout(0);
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+  res.flushHeaders();
+
+  // Set up activeStreams for the global MQTT handler to use
+  if (!activeStreams[serial_number]) {
+    activeStreams[serial_number] = { logs: [] };
+  }
+  activeStreams[serial_number].logs.push(res);
+  console.log(`[SSE] Added SSE client for serial ${serial_number}. Total clients: ${activeStreams[serial_number].logs.length}`);
+
+  mqttClient.publish(controlTopic, String(command), { retain: false }, (err) => {
+    if (err) {
+      console.error(`[SSE] Failed to publish control command to ${controlTopic}:`, err);
+      res.write(`event: error\ndata: ${JSON.stringify({ error: 'Failed to publish control command', details: err.message })}\n\n`);
+      res.end();
+      // Remove from activeStreams
+      if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
+        activeStreams[serial_number].logs = activeStreams[serial_number].logs.filter(r => r !== res);
+      }
+    } else {
+      console.log(`[SSE] Successfully published start command to ${controlTopic}`);
+      // Send a connection confirmation message
+      res.write(`data: ${JSON.stringify({ topic: 'connection', payload: 'SSE connection established for serial ' + serial_number })}\n\n`);
+    }
+  });
+
+  req.on('close', () => {
+    console.log(`[SSE] SSE connection closed for serial ${serial_number}`);
+    // Remove from activeStreams when connection closes
+    if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
+      activeStreams[serial_number].logs = activeStreams[serial_number].logs.filter(r => r !== res);
+      console.log(`[SSE] Removed SSE client for serial ${serial_number}. Remaining clients: ${activeStreams[serial_number].logs.length}`);
+    }
+  });
+});
+
+app.post('/api/logs/:serial_number/retrieve/stream/stop', (req, res) => {
+  const { serial_number } = req.params;
+  const controlTopic = `ekco/v1/${serial_number}/logs/control`;
+
+  mqttClient.publish(controlTopic, "0", { retain: false }, (err) => {
+    if (err) {
+      console.error(`Failed to send stop command to ${controlTopic}:`, err);
+    }
+  });
+
+  // Close all active SSE streams for this serial
+  if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
+    activeStreams[serial_number].logs.forEach(streamRes => {
+      streamRes.write('event: end\ndata: Stream stopped by server\n\n');
+      streamRes.end();
+    });
+    activeStreams[serial_number].logs = [];
+  }
+
+  // Always 200 OK
+  res.json({ message: `Stop command sent for ${serial_number}` });
+});
 
 //Use the client app
 app.use(express.static(path.join(__dirname, '/client/dist'), {
@@ -2100,89 +2219,6 @@ function getDistance(lat1, lng1, lat2, lng2) {
 app.use((err, req, res, next) => {
   console.error(err.stack);
   res.status(500).json({ error: 'Something went wrong!' });
-});
-
-// ---------------- MQTT Logs Functionality ---------------- //
-
-// In-memory log storage: { serial_number: [serial1, log2, ...] }
-const logsMap = {};
-
-// Track active SSE streams per serial_number
-const activeStreams = {};
-
-
-
-// Track active retrieve/stream connections (now handled by activeStreams)
-
-app.get('/logs/:serial_number/retrieve/stream', (req, res) => {
-  const { serial_number } = req.params;
-  const command = "1";
-  const controlTopic = `ekco/v1/${serial_number}/logs/control`;
-
-  console.log(`[SSE] Setting up stream for serial: ${serial_number}`);
-
-  req.socket.setTimeout(0);
-  res.set({
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-  });
-  res.flushHeaders();
-
-  // Set up activeStreams for the global MQTT handler to use
-  if (!activeStreams[serial_number]) {
-    activeStreams[serial_number] = { logs: [] };
-  }
-  activeStreams[serial_number].logs.push(res);
-  console.log(`[SSE] Added SSE client for serial ${serial_number}. Total clients: ${activeStreams[serial_number].logs.length}`);
-
-  mqttClient.publish(controlTopic, String(command), { retain: false }, (err) => {
-    if (err) {
-      console.error(`[SSE] Failed to publish control command to ${controlTopic}:`, err);
-      res.write(`event: error\ndata: ${JSON.stringify({ error: 'Failed to publish control command', details: err.message })}\n\n`);
-      res.end();
-      // Remove from activeStreams
-      if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
-        activeStreams[serial_number].logs = activeStreams[serial_number].logs.filter(r => r !== res);
-      }
-    } else {
-      console.log(`[SSE] Successfully published start command to ${controlTopic}`);
-      // Send a connection confirmation message
-      res.write(`data: ${JSON.stringify({ topic: 'connection', payload: 'SSE connection established for serial ' + serial_number })}\n\n`);
-    }
-  });
-
-  req.on('close', () => {
-    console.log(`[SSE] SSE connection closed for serial ${serial_number}`);
-    // Remove from activeStreams when connection closes
-    if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
-      activeStreams[serial_number].logs = activeStreams[serial_number].logs.filter(r => r !== res);
-      console.log(`[SSE] Removed SSE client for serial ${serial_number}. Remaining clients: ${activeStreams[serial_number].logs.length}`);
-    }
-  });
-});
-
-app.post('/logs/:serial_number/retrieve/stream/stop', (req, res) => {
-  const { serial_number } = req.params;
-  const controlTopic = `ekco/v1/${serial_number}/logs/control`;
-
-  mqttClient.publish(controlTopic, "0", { retain: false }, (err) => {
-    if (err) {
-      console.error(`Failed to send stop command to ${controlTopic}:`, err);
-    }
-  });
-
-  // Close all active SSE streams for this serial
-  if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
-    activeStreams[serial_number].logs.forEach(streamRes => {
-      streamRes.write('event: end\ndata: Stream stopped by server\n\n');
-      streamRes.end();
-    });
-    activeStreams[serial_number].logs = [];
-  }
-
-  // Always 200 OK
-  res.json({ message: `Stop command sent for ${serial_number}` });
 });
 
 //Render client
@@ -2454,6 +2490,11 @@ let latestGeofenceAlertTimestamp = Math.floor(Date.now() / 1000) - 60;
 function broadcastSingleAlert(alert) {
   console.log('📡 Broadcasting geofence alert:', alert);
 
+  if (!wss || !wss.clients) {
+    console.warn('WebSocket server not initialized yet or clients not available');
+    return;
+  }
+
   const message = JSON.stringify({
     type: 'new-alert',
     data: alert
@@ -2533,9 +2574,6 @@ async function checkAndBroadcastNewGeofenceAlerts() {
     console.error("❌ Error checking for new geofence alerts:", error);
   }
 }
-
-// Check for new geofence alerts every 2 seconds (more frequent than regular alerts)
-setInterval(checkAndBroadcastNewGeofenceAlerts, 2000);
 
 // Function to fetch and broadcast live trucks
 async function fetchAndBroadcastLiveTrucks() {

@@ -182,12 +182,22 @@ const getAlertsBySerial = async (req, res) => {
 
 const getDeviceHealth = async (req, res) => {
     try {
-        const result = await pool.query("SELECT * FROM device_health");
-        if (result.rows.length > 0) {
-            res.json(result.rows);
-        } else {
-            res.status(404).json({ error: "Item not found" });
-        }
+        const result = await pool.query(`
+            SELECT
+                dh.*,
+                COALESCE(vi.fleet_number, vi.vehicle_reg, 'N/A') as fleet_name,
+                vi.fleet_number,
+                vi.vehicle_reg,
+                vi.vehicle_name,
+                vi.vehicle_model,
+                vi.vehicle_year
+            FROM device_health dh
+            LEFT JOIN vehicle_info vi ON dh.device_serial::text = vi.device_serial
+                AND vi.company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
+            ORDER BY dh.device_serial
+        `);
+
+        res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
     }
