@@ -1648,14 +1648,9 @@ app.get('/api/trucks', authenticateRequest, async (req, res) => {
 app.get('/api/trucks/:device_serial', authenticateRequest, async (req, res) => {
   try {
     const { device_serial } = req.params;
-    const companyId = req.user?.company_id;
-    if (!companyId) {
-      return res.status(403).json({ error: 'No company assigned to user' });
-    }
-
     const result = await pool.query(
-      'SELECT * FROM vehicle_info WHERE device_serial = $1 AND company_id = $2',
-      [device_serial, companyId]
+      'SELECT * FROM vehicle_info WHERE device_serial = $1',
+      [device_serial]
     );
 
     if (result.rows.length === 0) {
@@ -1673,15 +1668,10 @@ app.get('/api/trucks/:device_serial/alerts', authenticateRequest, async (req, re
   try {
     const { device_serial } = req.params;
     const { limit = 50 } = req.query;
-    const companyId = req.user?.company_id;
-    if (!companyId) {
-      return res.status(403).json({ error: 'No company assigned to user' });
-    }
-
-    // Verify the vehicle exists and belongs to the company
+    // Verify the vehicle exists
     const vehicleResult = await pool.query(
-      'SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND company_id = $2',
-      [device_serial, companyId]
+      'SELECT device_serial FROM vehicle_info WHERE device_serial = $1',
+      [device_serial]
     );
 
     if (vehicleResult.rows.length === 0) {
@@ -1709,15 +1699,10 @@ app.get('/api/trucks/:device_serial/trips', authenticateRequest, async (req, res
   try {
     const { device_serial } = req.params;
     const { start, end, limit = 20 } = req.query;
-    const companyId = req.user?.company_id;
-    if (!companyId) {
-      return res.status(403).json({ error: 'No company assigned to user' });
-    }
-
     // First check if vehicle exists
     const vehicleResult = await pool.query(
-      'SELECT * FROM vehicle_info WHERE device_serial = $1 AND company_id = $2',
-      [device_serial, companyId]
+      'SELECT * FROM vehicle_info WHERE device_serial = $1',
+      [device_serial]
     );
 
     if (vehicleResult.rows.length === 0) {
