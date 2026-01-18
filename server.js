@@ -35,12 +35,12 @@ const pool = new Pool({
   min: 2,                     // Minimum connections to maintain
 
   // Idle connection management (CRITICAL for preventing locks)
-  idleTimeoutMillis: 30000,   // Close idle connections after 30 seconds
-  connectionTimeoutMillis: 2000, // Timeout acquiring connection from pool
+  idleTimeoutMillis: 60000,   // Close idle connections after 60 seconds
+  connectionTimeoutMillis: 10000, // Timeout acquiring connection from pool
 
   // Query timeouts (prevents long-running queries that cause locks)
-  query_timeout: 30000,       // 30 second query timeout
-  statement_timeout: 30000,   // 30 second statement timeout
+  query_timeout: 60000,       // 60 second query timeout
+  statement_timeout: 60000,   // 60 second statement timeout
 
   // Connection validation
   allowExitOnIdle: true,      // Allow pool to close when idle
@@ -95,7 +95,11 @@ pool.on('connect', () => {
 
 pool.on('error', (err) => {
   console.error('Unexpected error on idle client', err);
-  process.exit(-1);
+  // Don't exit immediately during startup - let initialization complete
+  // Only exit if we're not in the middle of database initialization
+  if (typeof global.databaseInitializing === 'undefined' || !global.databaseInitializing) {
+    process.exit(-1);
+  }
 });
 
 // Monitor pool health every 30 seconds
@@ -109,16 +113,32 @@ setInterval(() => {
 
 async function ensureGeofencePolygonColumns() {
   try {
+    // Check if pool is still available
+    if (pool.ending || pool.ended) {
+      console.log('Pool is closing/closed, skipping polygon columns creation');
+      return;
+    }
+
     await pool.query("ALTER TABLE geofences ADD COLUMN IF NOT EXISTS shape TEXT DEFAULT 'circle'");
     await pool.query("ALTER TABLE geofences ADD COLUMN IF NOT EXISTS polygon_coords JSONB");
     console.log('Ensured geofences table has shape and polygon_coords columns');
   } catch (err) {
-    console.error('Failed to ensure polygon columns on geofences table', err);
+    if (err.message && err.message.includes('Cannot use a pool after calling end on the pool')) {
+      console.log('Pool closed during polygon columns creation, skipping');
+    } else {
+      console.error('Failed to ensure polygon columns on geofences table', err);
+    }
   }
 }
 
 async function ensureGeofenceReferencesTable() {
   try {
+    // Check if pool is still available
+    if (pool.ending || pool.ended) {
+      console.log('Pool is closing/closed, skipping geofence references table creation');
+      return;
+    }
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS switch_geofences_references (
         id SERIAL PRIMARY KEY,
@@ -132,11 +152,11 @@ async function ensureGeofenceReferencesTable() {
     // Remove UNIQUE constraint if it exists (for existing tables)
     try {
       await pool.query(`
-        ALTER TABLE switch_geofences_references 
+        ALTER TABLE switch_geofences_references
         DROP CONSTRAINT IF EXISTS switch_geofences_references_incoming_name_key
       `);
       await pool.query(`
-        ALTER TABLE switch_geofences_references 
+        ALTER TABLE switch_geofences_references
         DROP CONSTRAINT IF EXISTS switch_geofences_references_incoming_name_unique
       `);
     } catch (constraintErr) {
@@ -165,12 +185,22 @@ async function ensureGeofenceReferencesTable() {
 
     console.log('Ensured geofence references table exists');
   } catch (err) {
-    console.error('Failed to ensure geofence references table', err);
+    if (err.message && err.message.includes('Cannot use a pool after calling end on the pool')) {
+      console.log('Pool closed during geofence references table creation, skipping');
+    } else {
+      console.error('Failed to ensure geofence references table', err);
+    }
   }
 }
 
 async function ensureGeofenceReferencesV2Table() {
   try {
+    // Check if pool is still available
+    if (pool.ending || pool.ended) {
+      console.log('Pool is closing/closed, skipping geofence references v2 table creation');
+      return;
+    }
+
     await pool.query(`
       CREATE TABLE IF NOT EXISTS geofence_references (
         id SERIAL PRIMARY KEY,
@@ -208,11 +238,16 @@ async function ensureGeofenceReferencesV2Table() {
 
     console.log('Ensured geofence references v2 table exists');
   } catch (err) {
-    console.error('Failed to ensure geofence references v2 table', err);
+    if (err.message && err.message.includes('Cannot use a pool after calling end on the pool')) {
+      console.log('Pool closed during geofence references v2 table creation, skipping');
+    } else {
+      console.error('Failed to ensure geofence references v2 table', err);
+    }
   }
 }
 
 async function initializeDatabase() {
+  global.databaseInitializing = true;
   try {
     await ensureGeofencePolygonColumns();
     await ensureGeofenceReferencesTable();
@@ -221,6 +256,8 @@ async function initializeDatabase() {
   } catch (error) {
     console.error('❌ Database initialization failed:', error);
     process.exit(1);
+  } finally {
+    global.databaseInitializing = false;
   }
 }
 
@@ -272,8 +309,9 @@ async function startServer() {
       });
     }, 30000);
 
-    // Start checking for geofence alerts now that WebSocket server is ready
+    // Start checking for geofence alerts and engine status updates now that WebSocket server is ready
     setInterval(checkAndBroadcastNewGeofenceAlerts, 2000);
+    setInterval(checkAndBroadcastEngineStatusUpdates, 2000);
 
 // Declare WebSocket server at module level
 
@@ -863,6 +901,47 @@ app.put('/api/geofences/:id', async (req, res) => {
     res.json({ ...geofence, trucks: processedTrucks });
   } catch (error) {
     console.error('Error updating geofence:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// New endpoint for updating only truck assignments (used by references)
+app.put('/api/geofences/:id/trucks', async (req, res) => {
+  const { id } = req.params;
+  const { trucks } = req.body;
+
+  if (!Array.isArray(trucks)) {
+    return res.status(400).json({ error: 'Trucks must be an array' });
+  }
+
+  try {
+    // Get the old trucks before update for geofence broadcasting
+    const oldGeofence = await pool.query('SELECT trucks FROM geofences WHERE id = $1', [id]);
+    if (oldGeofence.rows.length === 0) {
+      return res.status(404).json({ error: 'Geofence not found' });
+    }
+    const oldTrucks = oldGeofence.rows[0]?.trucks || [];
+
+    // Update only the trucks field - no spatial validation needed
+    const result = await pool.query(
+      'UPDATE geofences SET trucks = $1 WHERE id = $2 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords',
+      [trucks, id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Geofence not found' });
+    }
+
+    const geofence = result.rows[0];
+    const processedTrucks = Array.isArray(geofence.trucks) ? geofence.trucks.map(n => Number(n)).filter(v => !Number.isNaN(v)) : [];
+
+    // Send geofence updates to affected trucks
+    const allAffectedTrucks = [...new Set([...oldTrucks, ...processedTrucks])];
+    await sendGeofenceUpdate(allAffectedTrucks);
+
+    res.json({ ...geofence, trucks: processedTrucks });
+  } catch (error) {
+    console.error('Error updating geofence trucks:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -2471,6 +2550,9 @@ async function fetchLatestAlert() {
 // Store the timestamp of the last sent geofence alert
 let latestGeofenceAlertTimestamp = Math.floor(Date.now() / 1000) - 60;
 
+// Store the timestamp of the last sent engine status update
+let latestEngineStatusTimestamp = Math.floor(Date.now() / 1000) - 60;
+
 // Function to broadcast a single geofence alert
 function broadcastSingleAlert(alert) {
   console.log('📡 Broadcasting geofence alert:', alert);
@@ -2557,6 +2639,80 @@ async function checkAndBroadcastNewGeofenceAlerts() {
 
   } catch (error) {
     console.error("❌ Error checking for new geofence alerts:", error);
+  }
+}
+
+// Function to check for and broadcast new engine status updates
+async function checkAndBroadcastEngineStatusUpdates() {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+
+    const result = await pool.query(`
+      SELECT
+        device_serial,
+        time,
+        ignition_status
+      FROM engine_ts
+      WHERE time > $1
+      ORDER BY time DESC
+    `, [latestEngineStatusTimestamp]);
+
+    if (result.rows.length === 0) {
+      return;
+    }
+
+    // Discard updates in the future
+    const validUpdates = result.rows.filter(r => {
+      const t = parseInt(r.time);
+      if (t > now) {
+        return false;
+      }
+      return true;
+    });
+
+    if (validUpdates.length === 0) {
+      return;
+    }
+
+    // Group by device_serial and get the latest update for each device
+    const latestUpdatesByDevice = {};
+    validUpdates.forEach(update => {
+      if (!latestUpdatesByDevice[update.device_serial] ||
+          update.time > latestUpdatesByDevice[update.device_serial].time) {
+        latestUpdatesByDevice[update.device_serial] = update;
+      }
+    });
+
+    // Process and broadcast engine status updates
+    const engineUpdates = Object.values(latestUpdatesByDevice).map(update => {
+      let engineStatus = 'UNKNOWN';
+      if (update.ignition_on !== undefined) {
+        engineStatus = update.ignition_on ? 'ON' : 'OFF';
+      } else if (update.ignition_status) {
+        engineStatus = update.ignition_status.toUpperCase();
+      } else if (update.engine_status) {
+        engineStatus = update.engine_status.toUpperCase();
+      }
+
+      return {
+        device_serial: update.device_serial.toString(),
+        engine_status: engineStatus,
+        timestamp: update.time
+      };
+    });
+
+    // Update timestamp to the latest update time + 1
+    const maxTime = Math.max(...validUpdates.map(r => parseInt(r.time)));
+    latestEngineStatusTimestamp = maxTime + 1;
+
+    // Broadcast engine status updates
+    broadcast({
+      type: "engine_status_update",
+      data: engineUpdates
+    });
+
+  } catch (error) {
+    console.error("❌ Error checking for engine status updates:", error);
   }
 }
 
