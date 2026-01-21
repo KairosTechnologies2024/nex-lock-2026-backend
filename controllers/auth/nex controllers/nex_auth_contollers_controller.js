@@ -1,7 +1,7 @@
 const pool = require('../../../db');
 const bcrypt = require('bcryptjs');
 
-// Create a new controller and associated user
+
 const createController = async (req, res) => {
   const { name, email, company_id, password } = req.body;
 
@@ -10,16 +10,14 @@ const createController = async (req, res) => {
   }
 
   try {
-    // Check if company_id exists in customers_nex_lock
+    
     const companyResult = await pool.query('SELECT id FROM customers_nex_lock WHERE id = $1', [company_id]);
     if (companyResult.rows.length === 0) {
       return res.status(400).json({ error: 'Invalid company_id' });
     }
 
-    // Hash the password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Insert into controllers_nex_lock with role default 'controller' and status default true
     const controllerResult = await pool.query(
       'INSERT INTO controllers_nex_lock (name, email, role, company_id, status) VALUES ($1, $2, $3, $4, $5) RETURNING *',
       [name, email, 'controller', company_id, true]
@@ -27,7 +25,6 @@ const createController = async (req, res) => {
 
     const controller = controllerResult.rows[0];
 
-    // Insert into users_nex_lock with company_id
     await pool.query(
       'INSERT INTO users_nex_lock (email, password, role, company_id) VALUES ($1, $2, $3, $4)',
       [email, hashedPassword, 'controller', company_id]
@@ -66,13 +63,64 @@ const getControllerById = async (req, res) => {
   }
 };
 
+// Get controllers by company_id
+const getControllersByCompany = async (req, res) => {
+  const { companyId } = req.params;
+  try {
+    const result = await pool.query('SELECT * FROM controllers_nex_lock WHERE company_id = $1 ORDER BY id', [companyId]);
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching controllers by company:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+// Get all users by company_id (for controllers to see all company users)
+const getAllUsersByCompany = async (req, res) => {
+  const { companyId } = req.params;
+  try {
+    // Get all users from users_nex_lock table with the company_id
+    const usersResult = await pool.query('SELECT id, email, role, company_id FROM users_nex_lock WHERE company_id = $1 ORDER BY id', [companyId]);
+
+    // Get additional info for controllers
+    const controllerEmails = usersResult.rows.filter(user => user.role === 'controller').map(user => user.email);
+    let controllersInfo = {};
+
+    if (controllerEmails.length > 0) {
+      const controllersResult = await pool.query(
+        'SELECT email, name, status FROM controllers_nex_lock WHERE email = ANY($1)',
+        [controllerEmails]
+      );
+
+      controllersInfo = controllersResult.rows.reduce((acc, controller) => {
+        acc[controller.email] = { name: controller.name, status: controller.status };
+        return acc;
+      }, {});
+    }
+
+    // Combine user info with controller details
+    const users = usersResult.rows.map(user => ({
+      id: user.id,
+      email: user.email,
+      role: user.role,
+      company_id: user.company_id,
+      ...(controllersInfo[user.email] || {})
+    }));
+
+    res.json(users);
+  } catch (error) {
+    console.error('Error fetching all users by company:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
 // Update a controller
 const updateController = async (req, res) => {
   const { id } = req.params;
   const { name, email, company_id, status } = req.body;
 
   try {
-    // Check if company_id exists if provided
+ 
     if (company_id) {
       const companyResult = await pool.query('SELECT id FROM customers_nex_lock WHERE id = $1', [company_id]);
       if (companyResult.rows.length === 0) {
@@ -80,14 +128,13 @@ const updateController = async (req, res) => {
       }
     }
 
-    // Get current controller to check if email changed
     const currentResult = await pool.query('SELECT email FROM controllers_nex_lock WHERE id = $1', [id]);
     if (currentResult.rows.length === 0) {
       return res.status(404).json({ error: 'Controller not found' });
     }
     const oldEmail = currentResult.rows[0].email;
 
-    // Update controller (role is unchangeable)
+ 
     const result = await pool.query(
       'UPDATE controllers_nex_lock SET name = $1, email = $2, company_id = $3, status = $4 WHERE id = $5 RETURNING *',
       [name, email, company_id, status, id]
@@ -97,7 +144,7 @@ const updateController = async (req, res) => {
       return res.status(404).json({ error: 'Controller not found' });
     }
 
-    // If email changed, update users_nex_lock
+  
     if (email && email !== oldEmail) {
       await pool.query('UPDATE users_nex_lock SET email = $1 WHERE email = $2', [email, oldEmail]);
     }
@@ -109,21 +156,21 @@ const updateController = async (req, res) => {
   }
 };
 
-// Delete a controller
+
 const deleteController = async (req, res) => {
   const { id } = req.params;
   try {
-    // Get email to delete from users_nex_lock
+   
     const controllerResult = await pool.query('SELECT email FROM controllers_nex_lock WHERE id = $1', [id]);
     if (controllerResult.rows.length === 0) {
       return res.status(404).json({ error: 'Controller not found' });
     }
     const email = controllerResult.rows[0].email;
 
-    // Delete from controllers_nex_lock
+
     await pool.query('DELETE FROM controllers_nex_lock WHERE id = $1', [id]);
 
-    // Delete from users_nex_lock
+  
     await pool.query('DELETE FROM users_nex_lock WHERE email = $1', [email]);
 
     res.json({ message: 'Controller deleted successfully' });
@@ -137,6 +184,8 @@ module.exports = {
   createController,
   getControllers,
   getControllerById,
+  getControllersByCompany,
+  getAllUsersByCompany,
   updateController,
   deleteController,
 };

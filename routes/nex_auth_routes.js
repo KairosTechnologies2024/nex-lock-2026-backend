@@ -18,6 +18,8 @@ router.delete('/nex-customers/:id', authController.deleteCustomer);
 router.post('/nex-controllers', controllerController.createController);
 router.get('/nex-controllers', controllerController.getControllers);
 router.get('/nex-controllers/:id', controllerController.getControllerById);
+router.get('/nex-controllers/company/:companyId', controllerController.getControllersByCompany);
+router.get('/nex-users/company/:companyId', controllerController.getAllUsersByCompany);
 router.put('/nex-controllers/:id', controllerController.updateController);
 router.delete('/nex-controllers/:id', controllerController.deleteController);
 
