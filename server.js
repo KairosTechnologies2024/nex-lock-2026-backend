@@ -9,7 +9,7 @@ const port = process.env.PORT || 3001;
 const mqtt = require('mqtt');
 const mimeTypes = require('mime-types');
 const WebSocket = require('ws');
-const authController = require('./controllers/auth/nex super users/nex_auth_supers_controller');
+//const authController = require('./controllers/auth/nex super users/nex_auth_supers_controller');
 const authRoutes= require('./routes/nex_auth_routes');
 const deviceHealthRoutes = require('./routes/deviceHealthRoutes');
 
@@ -121,7 +121,8 @@ async function ensureGeofencePolygonColumns() {
 
     await pool.query("ALTER TABLE geofences ADD COLUMN IF NOT EXISTS shape TEXT DEFAULT 'circle'");
     await pool.query("ALTER TABLE geofences ADD COLUMN IF NOT EXISTS polygon_coords JSONB");
-    console.log('Ensured geofences table has shape and polygon_coords columns');
+    await pool.query("ALTER TABLE geofences ADD COLUMN IF NOT EXISTS company_id UUID");
+    console.log('Ensured geofences table has shape, polygon_coords, and company_id columns');
   } catch (err) {
     if (err.message && err.message.includes('Cannot use a pool after calling end on the pool')) {
       console.log('Pool closed during polygon columns creation, skipping');
@@ -639,29 +640,36 @@ async function sendGeofenceUpdate(serials = null) {
 
 app.get('/api/alerts/lock-stats', authenticateRequest, async (req, res)=>{
   try {
-         const result = await pool.query(`
-             SELECT
-                 a.time,
-                 a.device_serial,
-                 a.alert,
-                 COALESCE(vi.fleet_number, vi.vehicle_reg, 'Unknown Fleet') as fleet
-             FROM alert_ts a
-             LEFT JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
-             WHERE a.alert IN ('LOCKED', 'UNLOCKED', 'LOCK JAMMED !', 'LOCK JAM !')
-             ORDER BY a.time DESC
-         `);
-         console.log('lock stats alerts:', result.rows.length)
-         res.json(result.rows);
-     } catch (err) {
-         res.status(500).json({ error: "Database error", details: err.message });
-     }
+        const userCompanyId = req.user.company_id;
+
+        const result = await pool.query(`
+            SELECT
+                a.time,
+                a.device_serial,
+                a.alert,
+                COALESCE(vi.fleet_number, vi.vehicle_reg, 'Unknown Fleet') as fleet
+            FROM alert_ts a
+            INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial AND vi.nex_customer_id = $1
+            WHERE a.alert IN ('LOCKED', 'UNLOCKED', 'LOCK JAMMED !', 'LOCK JAM !')
+            ORDER BY a.time DESC
+        `, [userCompanyId]);
+        console.log('lock stats alerts:', result.rows.length)
+        res.json(result.rows);
+    } catch (err) {
+        res.status(500).json({ error: "Database error", details: err.message });
+    }
  });
 
 
-app.get('/api/geofences', async (req, res) => {
+app.get('/api/geofences', authenticateRequest, async (req, res) => {
   try {
-  
-  const result = await pool.query('SELECT id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords FROM geofences ORDER BY id');
+    const userCompanyId = req.user.company_id;
+    console.log("Fetching geofences for company:", userCompanyId);
+
+    const result = await pool.query(
+      'SELECT id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords FROM geofences WHERE company_id = $1 ORDER BY id',
+      [userCompanyId]
+    );
 
     const geofences = result.rows.map(row => {
 
@@ -774,8 +782,9 @@ app.get('/api/geofences/for-serial-test', async (req, res) => {
 
 
 
-app.post('/api/geofences', async (req, res) => {
+app.post('/api/geofences', authenticateRequest, async (req, res) => {
   const { name, lat, lng, radius, active, trucks, shape, polygonCoords } = req.body;
+  const userCompanyId = req.user.company_id;
   const normalizedShape = shape === 'polygon' ? 'polygon' : 'circle';
   const normalizedPolygon = Array.isArray(polygonCoords) ? polygonCoords.map((p) => ({
     lat: parseFloat(p.lat),
@@ -817,8 +826,8 @@ app.post('/api/geofences', async (req, res) => {
     }
 
     const result = await pool.query(
-      'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point, shape, polygon_coords) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8), $9, $10) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords',
-      [name, baseLat, baseLng, radiusKm, active, trucks, generateRandomColor(), centrePoint, normalizedShape, normalizedShape === 'polygon' ? JSON.stringify(normalizedPolygon) : null]
+      'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point, shape, polygon_coords, company_id) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8), $9, $10, $11) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords',
+      [name, baseLat, baseLng, radiusKm, active, trucks, generateRandomColor(), centrePoint, normalizedShape, normalizedShape === 'polygon' ? JSON.stringify(normalizedPolygon) : null, userCompanyId]
     );
 
     if (result.rows.length === 0) {
@@ -840,9 +849,10 @@ app.post('/api/geofences', async (req, res) => {
 
 
 
-app.put('/api/geofences/:id', async (req, res) => {
+app.put('/api/geofences/:id', authenticateRequest, async (req, res) => {
   const { id } = req.params;
   const { name, lat, lng, radius, active, trucks, color, shape, polygonCoords } = req.body;
+  const userCompanyId = req.user.company_id;
   const normalizedShape = shape === 'polygon' ? 'polygon' : 'circle';
   const normalizedPolygon = Array.isArray(polygonCoords) ? polygonCoords.map((p) => ({
     lat: parseFloat(p.lat),
@@ -861,7 +871,7 @@ app.put('/api/geofences/:id', async (req, res) => {
 
   try {
     // Check if the new name already exists (excluding the current geofence)
-    const nameCheck = await pool.query('SELECT id FROM geofences WHERE name = $1 AND id != $2', [name, id]);
+    const nameCheck = await pool.query('SELECT id FROM geofences WHERE name = $1 AND id != $2 AND company_id = $3', [name, id, userCompanyId]);
     if (nameCheck.rows.length > 0) {
       return res.status(400).json({ error: 'Geofence name already exists. Please choose a different name.' });
     }
@@ -869,8 +879,8 @@ app.put('/api/geofences/:id', async (req, res) => {
     // Check if the new geofence would intersect with any existing geofence (excluding the current one)
     if (normalizedShape === 'circle') {
       const overlapCheck = await pool.query(
-        'SELECT id FROM geofences WHERE ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, (radius_km + $4) * 1000) AND id != $3',
-        [baseLng, baseLat, id, radiusKm]
+        'SELECT id FROM geofences WHERE ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, (radius_km + $4) * 1000) AND id != $3 AND company_id = $5',
+        [baseLng, baseLat, id, radiusKm, userCompanyId]
       );
 
       if (overlapCheck.rows.length > 0) {
@@ -879,12 +889,12 @@ app.put('/api/geofences/:id', async (req, res) => {
     }
 
     // Get the old trucks before update
-    const oldGeofence = await pool.query('SELECT trucks FROM geofences WHERE id = $1', [id]);
+    const oldGeofence = await pool.query('SELECT trucks FROM geofences WHERE id = $1 AND company_id = $2', [id, userCompanyId]);
     const oldTrucks = oldGeofence.rows[0]?.trucks || [];
 
     const result = await pool.query(
-      'UPDATE geofences SET name = $1, lat = $2, lng = $3, radius_km = $4, active = $5, trucks = $6, color = $7, centre_point = ST_GeogFromText($8), shape = $9, polygon_coords = $10 WHERE id = $11 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords',
-      [name, baseLat, baseLng, radiusKm, active, trucks, color, centrePoint, normalizedShape, normalizedShape === 'polygon' ? JSON.stringify(normalizedPolygon) : null, id]
+      'UPDATE geofences SET name = $1, lat = $2, lng = $3, radius_km = $4, active = $5, trucks = $6, color = $7, centre_point = ST_GeogFromText($8), shape = $9, polygon_coords = $10 WHERE id = $11 AND company_id = $12 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords',
+      [name, baseLat, baseLng, radiusKm, active, trucks, color, centrePoint, normalizedShape, normalizedShape === 'polygon' ? JSON.stringify(normalizedPolygon) : null, id, userCompanyId]
     );
 
     if (result.rows.length === 0) {
@@ -947,15 +957,16 @@ app.put('/api/geofences/:id/trucks', async (req, res) => {
 });
 
 
-app.delete('/api/geofences/:id', async (req, res) => {
+app.delete('/api/geofences/:id', authenticateRequest, async (req, res) => {
   const { id } = req.params;
+  const userCompanyId = req.user.company_id;
 
   try {
     // Get the trucks before deletion
-    const geofence = await pool.query('SELECT trucks FROM geofences WHERE id = $1', [id]);
+    const geofence = await pool.query('SELECT trucks FROM geofences WHERE id = $1 AND company_id = $2', [id, userCompanyId]);
     const trucks = geofence.rows[0]?.trucks || [];
 
-    const result = await pool.query('DELETE FROM geofences WHERE id = $1 RETURNING *', [id]);
+    const result = await pool.query('DELETE FROM geofences WHERE id = $1 AND company_id = $2 RETURNING *', [id, userCompanyId]);
 
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'Geofence not found' });
@@ -1714,8 +1725,13 @@ app.get('/api/geofence-alerts', async (req, res) => {
 
 app.get('/api/trucks', authenticateRequest, async (req, res) => {
   try {
+    
+    const userCompanyId = req.user.company_id;
+  console.log("converted company id:", userCompanyId);
+
     const result = await pool.query(
-      'SELECT * FROM vehicle_info ORDER BY id'
+      'SELECT * FROM vehicle_info WHERE nex_customer_id = $1 ORDER BY id',
+      [userCompanyId]
     );
     res.json(result.rows);
   } catch (error) {
@@ -1727,13 +1743,15 @@ app.get('/api/trucks', authenticateRequest, async (req, res) => {
 app.get('/api/trucks/:device_serial', authenticateRequest, async (req, res) => {
   try {
     const { device_serial } = req.params;
+    const userCompanyId = req.user.company_id;
+
     const result = await pool.query(
-      'SELECT * FROM vehicle_info WHERE device_serial = $1',
-      [device_serial]
+      'SELECT * FROM vehicle_info WHERE device_serial = $1 AND nex_customer_id = $2',
+      [device_serial, userCompanyId]
     );
 
     if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Vehicle not found' });
+      return res.status(404).json({ error: 'Vehicle not found or access denied' });
     }
 
     res.json(result.rows[0]);
@@ -1747,14 +1765,16 @@ app.get('/api/trucks/:device_serial/alerts', authenticateRequest, async (req, re
   try {
     const { device_serial } = req.params;
     const { limit = 50 } = req.query;
-    // Verify the vehicle exists
+    const userCompanyId = req.user.company_id;
+
+    // Verify the vehicle exists and belongs to user's company
     const vehicleResult = await pool.query(
-      'SELECT device_serial FROM vehicle_info WHERE device_serial = $1',
-      [device_serial]
+      'SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND nex_customer_id = $2',
+      [device_serial, userCompanyId]
     );
 
     if (vehicleResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Vehicle not found' });
+      return res.status(404).json({ error: 'Vehicle not found or access denied' });
     }
 
     // Get alerts for this vehicle
@@ -1778,14 +1798,16 @@ app.get('/api/trucks/:device_serial/trips', authenticateRequest, async (req, res
   try {
     const { device_serial } = req.params;
     const { start, end, limit = 20 } = req.query;
-    // First check if vehicle exists
+    const userCompanyId = req.user.company_id;
+
+    // First check if vehicle exists and belongs to user's company
     const vehicleResult = await pool.query(
-      'SELECT * FROM vehicle_info WHERE device_serial = $1',
-      [device_serial]
+      'SELECT * FROM vehicle_info WHERE device_serial = $1 AND nex_customer_id = $2',
+      [device_serial, userCompanyId]
     );
 
     if (vehicleResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Vehicle not found' });
+      return res.status(404).json({ error: 'Vehicle not found or access denied' });
     }
 
     let query;
@@ -1982,13 +2004,15 @@ app.get('/api/ignitionStatus', authenticateRequest, async (req, res) => {
 
 app.get('/api/alerts/latest200', authenticateRequest, async (req, res)=>{
   try {
+    const userCompanyId = req.user.company_id;
+
     const result = await pool.query(`
         SELECT a.*
         FROM alert_ts a
-        INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+        INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial AND vi.nex_customer_id = $1
         ORDER BY a.time DESC
         LIMIT 200
-    `);
+    `, [userCompanyId]);
     console.log('latest 200 alerts', result.rows.length)
     res.json(result.rows);
   } catch (err) {
@@ -1997,12 +2021,14 @@ app.get('/api/alerts/latest200', authenticateRequest, async (req, res)=>{
 });
 app.get('/api/alerts/latest', authenticateRequest, async (req, res)=>{
   try {
+    const userCompanyId = req.user.company_id;
+
     const result = await pool.query(`
         SELECT DISTINCT ON (a.device_serial) a.*
         FROM alert_ts a
-        INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+        INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial AND vi.nex_customer_id = $1
         ORDER BY a.device_serial, a.time DESC
-    `);
+    `, [userCompanyId]);
     console.log('latest alerts', result.rows.length)
     res.json(result.rows);
   } catch (err) {
@@ -2083,7 +2109,7 @@ function generateRandomColor() {
 
 // Auth routes (including customers)
 app.use('/api', authRoutes);
-app.use('/api', deviceHealthRoutes);
+app.use('/api', authenticateRequest, deviceHealthRoutes);
 
 // ---------------- MQTT Logs Routes ---------------- //
 

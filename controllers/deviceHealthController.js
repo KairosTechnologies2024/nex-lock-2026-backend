@@ -15,7 +15,12 @@ const pool = new Pool({
 
 const getAllGpsData = async (req, res) => {
     try {
-        const result = await pool.query("SELECT * FROM gps_ts");
+        const userCompanyId = req.user.company_id;
+        const result = await pool.query(`
+            SELECT gps.* FROM gps_ts gps
+            INNER JOIN vehicle_info vi ON gps.device_serial::text = vi.device_serial
+            WHERE vi.company_id = $1
+        `, [userCompanyId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -24,11 +29,14 @@ const getAllGpsData = async (req, res) => {
 
 const getLatestGpsData = async (req, res) => {
     try {
+        const userCompanyId = req.user.company_id;
         const result = await pool.query(`
-            SELECT DISTINCT ON (device_serial) device_serial, ST_AsText(location) as location, speed, time
-            FROM gps_ts
-            ORDER BY device_serial, time DESC
-        `);
+            SELECT DISTINCT ON (gps.device_serial) gps.device_serial, ST_AsText(gps.location) as location, gps.speed, gps.time
+            FROM gps_ts gps
+            INNER JOIN vehicle_info vi ON gps.device_serial::text = vi.device_serial
+            WHERE vi.company_id = $1
+            ORDER BY gps.device_serial, gps.time DESC
+        `, [userCompanyId]);
         // Parse location to lat/lng
         const data = result.rows.map(row => {
             const match = row.location.match(/POINT\(([^ ]+) ([^)]+)\)/);
@@ -47,12 +55,23 @@ const getLatestGpsData = async (req, res) => {
 
 const getGpsDataBySerial = async (req, res) => {
     const { device_serial } = req.params;
+    const userCompanyId = req.user.company_id;
     try {
+        // First verify the device belongs to user's company
+        const deviceCheck = await pool.query(
+            "SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND company_id = $2",
+            [device_serial, userCompanyId]
+        );
+
+        if (deviceCheck.rows.length === 0) {
+            return res.status(404).json({ error: "Device not found or access denied" });
+        }
+
         const result = await pool.query("SELECT * FROM gps_ts WHERE device_serial = $1", [device_serial]);
         if (result.rows.length > 0) {
             res.json(result.rows);
         } else {
-            res.status(404).json({ error: "Item not found" });
+            res.status(404).json({ error: "GPS data not found" });
         }
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -61,7 +80,18 @@ const getGpsDataBySerial = async (req, res) => {
 
 const getGpsCoordinates = async (req, res) => {
     const { device_serial } = req.params;
+    const userCompanyId = req.user.company_id;
     try {
+        // First verify the device belongs to user's company
+        const deviceCheck = await pool.query(
+            "SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND company_id = $2",
+            [device_serial, userCompanyId]
+        );
+
+        if (deviceCheck.rows.length === 0) {
+            return res.status(404).json({ error: "Device not found or access denied" });
+        }
+
         const result = await pool.query(`
             SELECT device_serial, location, speed
             FROM gps_ts
@@ -82,10 +112,21 @@ const getGpsCoordinates = async (req, res) => {
 const getTripData = async (req, res) => {
     const { device_serial } = req.params;
     const { start, end } = req.query;
+    const userCompanyId = req.user.company_id;
     if (!start || !end) {
         return res.status(400).json({ error: "Start and end date are required" });
     }
     try {
+        // First verify the device belongs to user's company
+        const deviceCheck = await pool.query(
+            "SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND company_id = $2",
+            [device_serial, userCompanyId]
+        );
+
+        if (deviceCheck.rows.length === 0) {
+            return res.status(404).json({ error: "Device not found or access denied" });
+        }
+
         const result = await pool.query(
             `
       SELECT
@@ -114,7 +155,12 @@ const getTripData = async (req, res) => {
 
 const getAllAlerts = async (req, res) => {
     try {
-        const result = await pool.query("SELECT * FROM alert_ts");
+        const userCompanyId = req.user.company_id;
+        const result = await pool.query(`
+            SELECT a.* FROM alert_ts a
+            INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+            WHERE vi.company_id = $1
+        `, [userCompanyId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -123,11 +169,14 @@ const getAllAlerts = async (req, res) => {
 
 const getLatestAlerts = async (req, res) => {
     try {
+        const userCompanyId = req.user.company_id;
         const result = await pool.query(`
-            SELECT DISTINCT ON (device_serial) *
-            FROM alert_ts
-            ORDER BY device_serial, time DESC
-        `);
+            SELECT DISTINCT ON (a.device_serial) a.*
+            FROM alert_ts a
+            INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+            WHERE vi.company_id = $1
+            ORDER BY a.device_serial, a.time DESC
+        `, [userCompanyId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -136,12 +185,15 @@ const getLatestAlerts = async (req, res) => {
 
 const getLatest200Alerts = async (req, res) => {
     try {
+        const userCompanyId = req.user.company_id;
         const result = await pool.query(`
-            SELECT *
-            FROM alert_ts
-            ORDER BY time DESC
+            SELECT a.*
+            FROM alert_ts a
+            INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+            WHERE vi.company_id = $1
+            ORDER BY a.time DESC
             LIMIT 200
-        `);
+        `, [userCompanyId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -150,14 +202,17 @@ const getLatest200Alerts = async (req, res) => {
 
 const getTop200AlertsPerDevice = async (req, res) => {
     try {
+        const userCompanyId = req.user.company_id;
         const result = await pool.query(`
             SELECT * FROM (
-                SELECT *,
-                       ROW_NUMBER() OVER (PARTITION BY device_serial ORDER BY time DESC) as rn
-                FROM alert_ts
+                SELECT a.*,
+                       ROW_NUMBER() OVER (PARTITION BY a.device_serial ORDER BY a.time DESC) as rn
+                FROM alert_ts a
+                INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+                WHERE vi.company_id = $1
             ) sub
             WHERE rn <= 200
-        `);
+        `, [userCompanyId]);
         res.json(result.rows);
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -166,12 +221,23 @@ const getTop200AlertsPerDevice = async (req, res) => {
 
 const getAlertsBySerial = async (req, res) => {
     const { device_serial } = req.params;
+    const userCompanyId = req.user.company_id;
     try {
+        // First verify the device belongs to user's company
+        const deviceCheck = await pool.query(
+            "SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND company_id = $2",
+            [device_serial, userCompanyId]
+        );
+
+        if (deviceCheck.rows.length === 0) {
+            return res.status(404).json({ error: "Device not found or access denied" });
+        }
+
         const result = await pool.query("SELECT * FROM alert_ts WHERE device_serial = $1", [device_serial]);
         if (result.rows.length > 0) {
             res.json(result.rows);
         } else {
-            res.status(404).json({ error: "Item not found" });
+            res.status(404).json({ error: "Alerts not found" });
         }
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -182,6 +248,7 @@ const getAlertsBySerial = async (req, res) => {
 
 const getDeviceHealth = async (req, res) => {
     try {
+        const userCompanyId = req.user.company_id;
         const result = await pool.query(`
             SELECT
                 dh.*,
@@ -192,10 +259,10 @@ const getDeviceHealth = async (req, res) => {
                 vi.vehicle_model,
                 vi.vehicle_year
             FROM device_health dh
-            LEFT JOIN vehicle_info vi ON dh.device_serial::text = vi.device_serial
-                AND vi.company_id = 'e5a99ee4-4306-4065-bacd-876004cf1555'
+            INNER JOIN vehicle_info vi ON dh.device_serial::text = vi.device_serial
+            WHERE vi.nex_customer_id = $1
             ORDER BY dh.device_serial
-        `);
+        `, [userCompanyId]);
 
         res.json(result.rows);
     } catch (err) {
@@ -205,11 +272,16 @@ const getDeviceHealth = async (req, res) => {
 
 const getMotorHealth = async (req, res) => {
     try {
-        const result = await pool.query("SELECT * FROM actuators");
+        const userCompanyId = req.user.company_id;
+        const result = await pool.query(`
+            SELECT a.* FROM actuators a
+            INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+            WHERE vi.nex_customer_id = $1
+        `, [userCompanyId]);
         if (result.rows.length > 0) {
             res.json(result.rows);
         } else {
-            res.status(404).json({ error: "Item not found" });
+            res.status(404).json({ error: "Motor health data not found" });
         }
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -220,12 +292,23 @@ const getMotorHealth = async (req, res) => {
 
 const getIgnitionStatus = async (req, res) => {
     const { device_serial } = req.params;
+    const userCompanyId = req.user.company_id;
     try {
+        // First verify the device belongs to user's company
+        const deviceCheck = await pool.query(
+            "SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND nex_customer_id = $2",
+            [device_serial, userCompanyId]
+        );
+
+        if (deviceCheck.rows.length === 0) {
+            return res.status(404).json({ error: "Device not found or access denied" });
+        }
+
         const result = await pool.query("SELECT * FROM engine_ts WHERE device_serial = $1", [device_serial]);
         if (result.rows.length > 0) {
             res.json(result.rows);
         } else {
-            res.status(404).json({ error: "Item not found" });
+            res.status(404).json({ error: "Ignition data not found" });
         }
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -236,12 +319,16 @@ const getIgnitionStatus = async (req, res) => {
 
 const getVehicleInfo = async (req, res) => {
     const { device_serial } = req.params;
+    const userCompanyId = req.user.company_id;
     try {
-        const result = await pool.query("SELECT * FROM vehicle_info WHERE device_serial = $1", [device_serial]);
+        const result = await pool.query(
+            "SELECT * FROM vehicle_info WHERE device_serial = $1 AND nex_customer_id = $2",
+            [device_serial, userCompanyId]
+        );
         if (result.rows.length > 0) {
             res.json(result.rows[0]);
         } else {
-            res.status(404).json({ error: "Vehicle not found" });
+            res.status(404).json({ error: "Vehicle not found or access denied" });
         }
     } catch (err) {
         res.status(500).json({ error: "Database error", details: err.message });
@@ -252,7 +339,18 @@ const getVehicleInfo = async (req, res) => {
 
 const enableAutoLock = async (req, res) => {
     const { device_serial } = req.params;
+    const userCompanyId = req.user.company_id;
     try {
+        // First verify the device belongs to user's company
+        const deviceCheck = await pool.query(
+            "SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND nex_customer_id = $2",
+            [device_serial, userCompanyId]
+        );
+
+        if (deviceCheck.rows.length === 0) {
+            return res.status(404).json({ error: "Device not found or access denied" });
+        }
+
         // Update device_health table to set auto_lock to true
         const result = await pool.query(
             "UPDATE device_health SET auto_lock = true WHERE device_serial = $1",
@@ -271,7 +369,18 @@ const enableAutoLock = async (req, res) => {
 
 const disableAutoLock = async (req, res) => {
     const { device_serial } = req.params;
+    const userCompanyId = req.user.company_id;
     try {
+        // First verify the device belongs to user's company
+        const deviceCheck = await pool.query(
+            "SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND nex_customer_id = $2",
+            [device_serial, userCompanyId]
+        );
+
+        if (deviceCheck.rows.length === 0) {
+            return res.status(404).json({ error: "Device not found or access denied" });
+        }
+
         // Update device_health table to set auto_lock to false
         const result = await pool.query(
             "UPDATE device_health SET auto_lock = false WHERE device_serial = $1",
@@ -292,7 +401,18 @@ const disableAutoLock = async (req, res) => {
 
 const resetDevice = async (req, res) => {
     const { device_serial } = req.params;
+    const userCompanyId = req.user.company_id;
     try {
+        // First verify the device belongs to user's company
+        const deviceCheck = await pool.query(
+            "SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND nex_customer_id = $2",
+            [device_serial, userCompanyId]
+        );
+
+        if (deviceCheck.rows.length === 0) {
+            return res.status(404).json({ error: "Device not found or access denied" });
+        }
+
         // This is a placeholder - implement actual device reset logic
         // For now, just return success
         res.json({ success: true, message: "Device reset initiated" });
