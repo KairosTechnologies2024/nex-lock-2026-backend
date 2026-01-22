@@ -1723,6 +1723,10 @@ app.get('/api/geofence-alerts', async (req, res) => {
   }
 });
 
+app.use('/api', authRoutes);
+app.use('/api', deviceHealthRoutes);
+
+
 app.get('/api/trucks', authenticateRequest, async (req, res) => {
   try {
     
@@ -2108,8 +2112,7 @@ function generateRandomColor() {
 }
 
 // Auth routes (including customers)
-app.use('/api', authRoutes);
-app.use('/api', deviceHealthRoutes);
+
 
 // ---------------- MQTT Logs Routes ---------------- //
 
