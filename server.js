@@ -636,7 +636,8 @@ async function sendGeofenceUpdate(serials = null) {
     throw error;
   }
 }
-
+app.use('/api', authRoutes);
+app.use('/api',  deviceHealthRoutes);
 
 app.get('/api/alerts/lock-stats', authenticateRequest, async (req, res)=>{
   try {
@@ -1722,10 +1723,6 @@ app.get('/api/geofence-alerts', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
-
-app.use('/api', authRoutes);
-app.use('/api', deviceHealthRoutes);
-
 
 app.get('/api/trucks', authenticateRequest, async (req, res) => {
   try {
