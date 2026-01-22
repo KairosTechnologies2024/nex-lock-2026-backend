@@ -29,37 +29,36 @@ function authenticateRequest(req, res, next) {
 }
 
 
-router.use(authenticateRequest);
+
 
 // Device Health routes
-router.get('/device-health', deviceHealthController.getDeviceHealth);
-router.get('/motor-health', deviceHealthController.getMotorHealth);
+router.get('/device-health', authenticateRequest, deviceHealthController.getDeviceHealth);
+router.get('/motor-health', authenticateRequest, deviceHealthController.getMotorHealth);
 
 // GPS routes
-router.get('/gps', deviceHealthController.getAllGpsData);
-router.get('/gps/latest', deviceHealthController.getLatestGpsData);
-router.get('/gps/:device_serial', deviceHealthController.getGpsDataBySerial);
-router.get('/gps/coordinates/:device_serial', deviceHealthController.getGpsCoordinates);
-router.get('/gps/trip/:device_serial', deviceHealthController.getTripData);
+router.get('/gps', authenticateRequest,deviceHealthController.getAllGpsData);
+router.get('/gps/latest', authenticateRequest, deviceHealthController.getLatestGpsData);
+router.get('/gps/:device_serial',authenticateRequest, deviceHealthController.getGpsDataBySerial);
+router.get('/gps/coordinates/:device_serial', authenticateRequest, deviceHealthController.getGpsCoordinates);
+router.get('/gps/trip/:device_serial', authenticateRequest, deviceHealthController.getTripData);
 
 // Alerts routes
-router.get('/alerts', deviceHealthController.getAllAlerts);
-router.get('/alerts/latest', deviceHealthController.getLatestAlerts);
-router.get('/alerts/latest200', deviceHealthController.getLatest200Alerts);
-router.get('/alerts/top200', deviceHealthController.getTop200AlertsPerDevice);
-router.get('/alerts/:device_serial', deviceHealthController.getAlertsBySerial);
+router.get('/alerts', authenticateRequest, deviceHealthController.getAllAlerts);
+router.get('/alerts/latest', authenticateRequest, deviceHealthController.getLatestAlerts);
+router.get('/alerts/latest200', authenticateRequest, deviceHealthController.getLatest200Alerts);
+router.get('/alerts/top200', authenticateRequest, deviceHealthController.getTop200AlertsPerDevice);
+router.get('/alerts/:device_serial', authenticateRequest, deviceHealthController.getAlertsBySerial);
 
 // Ignition routes
-router.get('/ignition/:device_serial', deviceHealthController.getIgnitionStatus);
+router.get('/ignition/:device_serial', authenticateRequest, deviceHealthController.getIgnitionStatus);
 
 // Vehicle routes
-router.get('/vehicles/vehicle/:device_serial', deviceHealthController.getVehicleInfo);
+router.get('/vehicles/vehicle/:device_serial', authenticateRequest, deviceHealthController.getVehicleInfo);
 
 // Lock control routes
-router.post('/locks/enable-auto-lock/:device_serial', deviceHealthController.enableAutoLock);
-router.post('/locks/disable-auto-lock/:device_serial', deviceHealthController.disableAutoLock);
+router.post('/locks/enable-auto-lock/:device_serial', authenticateRequest, deviceHealthController.enableAutoLock);
+router.post('/locks/disable-auto-lock/:device_serial', authenticateRequest, deviceHealthController.disableAutoLock);
 
 // Device reset routes
-router.post('/device/reset/:device_serial', deviceHealthController.resetDevice);
-
+router.post('/device/reset/:device_serial', authenticateRequest, deviceHealthController.resetDevice);
 module.exports = router;
