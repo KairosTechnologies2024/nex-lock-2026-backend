@@ -2109,7 +2109,7 @@ function generateRandomColor() {
 
 // Auth routes (including customers)
 app.use('/api', authRoutes);
-
+app.use('/api', deviceHealthRoutes);
 
 // ---------------- MQTT Logs Routes ---------------- //
 
@@ -2794,9 +2794,6 @@ process.on('unhandledRejection', (reason, promise) => {
   gracefulShutdown();
 });
 
-
-
-
 // Helper: normalize incoming truck identifiers to canonical device_serial values using vehicle_info.
 // If an identifier (device_serial, vehicle_reg or fleet_number) doesn't exist, insert a minimal vehicle_info row.
 // Helper: normalize incoming truck identifiers to canonical device_serial values using vehicle_info.
@@ -2888,7 +2885,3 @@ app.get('/api/geocode/reverse', async (req, res) => {
     res.status(500).json({ error: 'Geocoding service error' });
   }
 });
-
-
-
-app.use('/api', authenticateRequest, deviceHealthRoutes);
