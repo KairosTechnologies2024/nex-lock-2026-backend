@@ -182,7 +182,7 @@ async function handleGlobalGeofenceEvent(deviceSerial, isInsideAnyFence, timesta
    
     await pool.query(`
       INSERT INTO geofence_alert_ts (time, geofence_id, device_serial, alert)
-      VALUES ($1, $2, $3::text, $4)
+      VALUES ($1, $2, $3::bigint, $4)
     `, [timestamp, null, deviceSerial, isInsideAnyFence ? `GLOBAL_INSIDE_ALL_FENCES SCRIPT - ${registrationNumber}` : 'OUTSIDE GEOFENCE']);
 
     console.log(`📝 [${new Date().toISOString()}] Backup: Geofence alert logged to database for ${deviceSerial} (${registrationNumber})`);

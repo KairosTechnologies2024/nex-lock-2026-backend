@@ -12,6 +12,7 @@ const WebSocket = require('ws');
 //const authController = require('./controllers/auth/nex super users/nex_auth_supers_controller');
 const authRoutes= require('./routes/nex_auth_routes');
 const deviceHealthRoutes = require('./routes/deviceHealthRoutes');
+const alertsRoutes = require('./routes/alertsRoutes');
 
 // WebSocket variable server at module level
 let wss;
@@ -57,30 +58,7 @@ const pool = new Pool({
 const lockStatusMap = {};
 
 // ---------------- Auth Middleware ---------------- //
-function authenticateRequest(req, res, next) {
-  try {
-    const authHeader = req.headers['authorization'] || '';
-    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
-    if (!token) {
-      return res.status(401).json({ error: 'Authentication token missing' });
-    }
-
-    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-      if (err) {
-        return res.status(401).json({ error: 'Invalid or expired token' });
-      }
-
-      req.user = decoded;
-      console.log('Authenticated user:', req.user);
-      console.log('token:', token);
-      next();
-    });
-  } catch (err) {
-    console.error('Auth middleware error:', err);
-    return res.status(500).json({ error: 'Internal server error' });
-  }
-}
 
 // ---------------- MQTT Logs Functionality ---------------- //
 // In-memory log storage: { serial_number: [serial1, log2, ...] }
@@ -111,6 +89,22 @@ setInterval(() => {
   });
 }, 30000);
 
+// Wrap pool.query with better error handling to catch protocol issues
+const originalPoolQuery = pool.query.bind(pool);
+pool.query = async function(...args) {
+  try {
+    return await originalPoolQuery(...args);
+  } catch (error) {
+    if (error.code === 'ERR_OUT_OF_RANGE' || (error.message && error.message.includes('offset'))) {
+      console.error('🚨 CRITICAL: Protocol buffer corruption detected');
+      console.error('Query:', typeof args[0] === 'string' ? args[0].substring(0, 150) : 'unknown');
+      console.error('Error:', error.message);
+      throw new Error(`Database protocol error (likely geometry column): ${error.message}`);
+    }
+    throw error;
+  }
+};
+
 async function ensureGeofencePolygonColumns() {
   try {
     // Check if pool is still available
@@ -122,10 +116,12 @@ async function ensureGeofencePolygonColumns() {
     await pool.query("ALTER TABLE geofences ADD COLUMN IF NOT EXISTS shape TEXT DEFAULT 'circle'");
     await pool.query("ALTER TABLE geofences ADD COLUMN IF NOT EXISTS polygon_coords JSONB");
     await pool.query("ALTER TABLE geofences ADD COLUMN IF NOT EXISTS company_id UUID");
-    console.log('Ensured geofences table has shape, polygon_coords, and company_id columns');
+    console.log('✅ Ensured geofences table has shape, polygon_coords, and company_id columns');
   } catch (err) {
     if (err.message && err.message.includes('Cannot use a pool after calling end on the pool')) {
       console.log('Pool closed during polygon columns creation, skipping');
+    } else if (err.message && err.message.includes('protocol')) {
+      console.error('⚠️ Protocol error during schema creation - will retry on next connection');
     } else {
       console.error('Failed to ensure polygon columns on geofences table', err);
     }
@@ -278,19 +274,33 @@ async function startServer() {
     wss.on('connection', (ws) => {
       console.log('New WebSocket connection');
 
-      // Add heartbeat mechanism
+      // Store company_id for this connection (will be set when client authenticates)
+      ws.company_id = null;
       ws.isAlive = true;
+      
       ws.on('pong', () => {
         ws.isAlive = true;
         console.log('WebSocket pong received');
       });
 
       ws.on('message', (message) => {
-        console.log('Received:', message);
+        try {
+          const data = JSON.parse(message);
+          
+          // If client sends auth message with their company_id
+          if (data.type === 'auth') {
+            ws.company_id = data.company_id;
+            console.log('🔐 WebSocket client authenticated for company:', ws.company_id);
+          } else {
+            console.log('Received:', message);
+          }
+        } catch (err) {
+          console.log('Received:', message);
+        }
       });
 
       ws.on('close', () => {
-        console.log('WebSocket connection closed');
+        console.log('WebSocket connection closed for company:', ws.company_id);
       });
 
       ws.on('error', (error) => {
@@ -325,7 +335,34 @@ async function startServer() {
 startServer();
 
 
+function authenticateRequest(req, res, next) {
+  try {
+    const authHeader = req.headers['authorization'] || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
 
+    if (!token) {
+      return res.status(401).json({ error: 'Authentication token missing' });
+    }
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+      if (err) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+      }
+
+      req.user = decoded;
+      console.log('Authenticated user:', req.user);
+      console.log('token:', token);
+      next();
+    });
+  } catch (err) {
+    console.error('Auth middleware error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+}
+
+
+
+module.exports = authenticateRequest;
 
 // Helper function to calculate polygon centroid
 const calculatePolygonCentroid = (polygon) => {
@@ -343,17 +380,19 @@ const calculatePolygonCentroid = (polygon) => {
 // ---------------- MQTT Reset ---------------- //
 
 // Global broadcast function (moved outside startServer for global access)
-function broadcast(data) {
+// Company-aware broadcast - only sends to authenticated clients for the target company
+function broadcast(data, targetCompanyId = null) {
   if (!wss) {
     console.warn('WebSocket server not initialized yet');
     return;
   }
   const message = JSON.stringify(data);
   wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
+    // Only send if client is authenticated AND belongs to the target company
+    if (client.readyState === WebSocket.OPEN && 
+        client.company_id && 
+        (!targetCompanyId || client.company_id === targetCompanyId)) {
       client.send(message);
-    } else {
-      console.log("Client not open:", client.readyState);
     }
   });
 }
@@ -405,15 +444,23 @@ const lockVehicle = async (req, res) => {
                         });
                         res.json({ message: "Command sent successfully", topics: [topic, secondTopic], payload });
 
-                        // Broadcast lock status update via WebSocket for live updates
-                        broadcast({
-                            type: "lock_status_update",
-                            data: {
-                                device_serial: serial_number,
-                                lock_status: status === 1 ? 'LOCKED' : 'UNLOCKED',
-                                timestamp: Math.floor(Date.now() / 1000)
+                        // Broadcast lock status update via WebSocket for live updates (company-filtered)
+                        pool.query(
+                            'SELECT nex_customer_id FROM vehicle_info WHERE device_serial = $1',
+                            [serial_number]
+                        ).then(companyResult => {
+                            if (companyResult.rows.length > 0) {
+                                const companyId = companyResult.rows[0].nex_customer_id;
+                                broadcast({
+                                    type: "lock_status_update",
+                                    data: {
+                                        device_serial: serial_number,
+                                        lock_status: status === 1 ? 'LOCKED' : 'UNLOCKED',
+                                        timestamp: Math.floor(Date.now() / 1000)
+                                    }
+                                }, companyId);
                             }
-                        });
+                        }).catch(err => console.error('Error fetching company for lock broadcast:', err));
                     }
                     client.end();
                 }
@@ -636,30 +683,102 @@ async function sendGeofenceUpdate(serials = null) {
     throw error;
   }
 }
+
+
+
+
+
+
+
+
+
 app.use('/api', authRoutes);
-app.use('/api',  deviceHealthRoutes);
 
-app.get('/api/alerts/lock-stats', authenticateRequest, async (req, res)=>{
-  try {
-        const userCompanyId = req.user.company_id;
+// Register alerts routes with pool dependency (isolated before other auth middlewares)
+const alertsRouter = alertsRoutes(pool);
+app.use('/api', alertsRouter);
 
-        const result = await pool.query(`
-            SELECT
-                a.time,
-                a.device_serial,
-                a.alert,
-                COALESCE(vi.fleet_number, vi.vehicle_reg, 'Unknown Fleet') as fleet
-            FROM alert_ts a
-            INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial AND vi.nex_customer_id = $1
-            WHERE a.alert IN ('LOCKED', 'UNLOCKED', 'LOCK JAMMED !', 'LOCK JAM !')
-            ORDER BY a.time DESC
-        `, [userCompanyId]);
-        console.log('lock stats alerts:', result.rows.length)
-        res.json(result.rows);
-    } catch (err) {
-        res.status(500).json({ error: "Database error", details: err.message });
+// ---------------- MQTT Logs Routes (No Auth Required) ---------------- //
+
+app.get('/api/logs/:serial_number/retrieve/stream', (req, res) => {
+  const { serial_number } = req.params;
+  const command = "1";
+  const controlTopic = `ekco/v1/${serial_number}/logs/control`;
+
+  console.log(`[SSE] Setting up stream for serial: ${serial_number}`);
+
+  req.socket.setTimeout(0);
+  res.set({
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+  });
+  res.flushHeaders();
+
+  // Set up activeStreams for the global MQTT handler to use
+  if (!activeStreams[serial_number]) {
+    activeStreams[serial_number] = { logs: [] };
+  }
+  activeStreams[serial_number].logs.push(res);
+  console.log(`[SSE] Added SSE client for serial ${serial_number}. Total clients: ${activeStreams[serial_number].logs.length}`);
+
+  mqttClient.publish(controlTopic, String(command), { retain: false }, (err) => {
+    if (err) {
+      console.error(`[SSE] Failed to publish control command to ${controlTopic}:`, err);
+      res.write(`event: error\ndata: ${JSON.stringify({ error: 'Failed to publish control command', details: err.message })}\n\n`);
+      res.end();
+      // Remove from activeStreams
+      if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
+        activeStreams[serial_number].logs = activeStreams[serial_number].logs.filter(r => r !== res);
+      }
+    } else {
+      console.log(`[SSE] Successfully published start command to ${controlTopic}`);
+      // Send a connection confirmation message
+      res.write(`data: ${JSON.stringify({ topic: 'connection', payload: 'SSE connection established for serial ' + serial_number })}\n\n`);
     }
- });
+  });
+
+  req.on('close', () => {
+    console.log(`[SSE] SSE connection closed for serial ${serial_number}`);
+    // Remove from activeStreams when connection closes
+    if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
+      activeStreams[serial_number].logs = activeStreams[serial_number].logs.filter(r => r !== res);
+      console.log(`[SSE] Removed SSE client for serial ${serial_number}. Remaining clients: ${activeStreams[serial_number].logs.length}`);
+    }
+  });
+});
+
+app.post('/api/logs/:serial_number/retrieve/stream/stop', (req, res) => {
+  const { serial_number } = req.params;
+  const controlTopic = `ekco/v1/${serial_number}/logs/control`;
+
+  mqttClient.publish(controlTopic, "0", { retain: false }, (err) => {
+    if (err) {
+      console.error(`Failed to send stop command to ${controlTopic}:`, err);
+    }
+  });
+
+  // Close all active SSE streams for this serial
+  if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
+    activeStreams[serial_number].logs.forEach(streamRes => {
+      streamRes.write('event: end\ndata: Stream stopped by server\n\n');
+      streamRes.end();
+    });
+    activeStreams[serial_number].logs = [];
+  }
+
+  // Always 200 OK
+  res.json({ message: `Stop command sent for ${serial_number}` });
+});
+
+// -------- Protected Routes (Auth Required) -------- //
+
+
+
+
+
+app.use('/api', authenticateRequest, deviceHealthRoutes);
+
 
 
 app.get('/api/geofences', authenticateRequest, async (req, res) => {
@@ -817,8 +936,8 @@ app.post('/api/geofences', authenticateRequest, async (req, res) => {
       }
 
       const overlapCheck = await pool.query(
-        'SELECT id FROM geofences WHERE ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, (radius_km + $3) * 1000)',
-        [baseLng, baseLat, radiusKm]
+        'SELECT id FROM geofences WHERE shape = $4 AND (111.32 * COS(RADIANS(lat)) * (lng - $1)) ^ 2 + (111.32 * (lat - $2)) ^ 2 <= ((radius_km + $3) * 1000 / 1000) ^ 2',
+        [baseLng, baseLat, radiusKm, 'circle']
       );
 
       if (overlapCheck.rows.length > 0) {
@@ -880,8 +999,8 @@ app.put('/api/geofences/:id', authenticateRequest, async (req, res) => {
     // Check if the new geofence would intersect with any existing geofence (excluding the current one)
     if (normalizedShape === 'circle') {
       const overlapCheck = await pool.query(
-        'SELECT id FROM geofences WHERE ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, (radius_km + $4) * 1000) AND id != $3 AND company_id = $5',
-        [baseLng, baseLat, id, radiusKm, userCompanyId]
+        'SELECT id FROM geofences WHERE shape = $5 AND id != $3 AND company_id = $6 AND (111.32 * COS(RADIANS(lat)) * (lng - $1)) ^ 2 + (111.32 * (lat - $2)) ^ 2 <= ((radius_km + $4) * 1000 / 1000) ^ 2',
+        [baseLng, baseLat, id, radiusKm, 'circle', userCompanyId]
       );
 
       if (overlapCheck.rows.length > 0) {
@@ -917,7 +1036,7 @@ app.put('/api/geofences/:id', authenticateRequest, async (req, res) => {
 });
 
 // New endpoint for updating only truck assignments (used by references)
-app.put('/api/geofences/:id/trucks', async (req, res) => {
+app.put('/api/geofences/:id/trucks', authenticateRequest, async (req, res) => {
   const { id } = req.params;
   const { trucks } = req.body;
 
@@ -1402,7 +1521,7 @@ app.post('/api/geofences/city-dictionary', async (req, res) => {
 });
 
 // Geofence References CRUD endpoints
-app.get('/api/geofence-references', async (req, res) => {
+app.get('/api/geofence-references', authenticateRequest, async (req, res) => {
   try {
     const result = await pool.query('SELECT * FROM switch_geofences_references ORDER BY incoming_name');
     res.json(result.rows);
@@ -1412,7 +1531,7 @@ app.get('/api/geofence-references', async (req, res) => {
   }
 });
 
-app.post('/api/geofence-references', async (req, res) => {
+app.post('/api/geofence-references', authenticateRequest, async (req, res) => {
   const { incoming_name, outgoing_name } = req.body;
 
   if (!incoming_name || !outgoing_name) {
@@ -1438,7 +1557,7 @@ app.post('/api/geofence-references', async (req, res) => {
   }
 });
 
-app.put('/api/geofence-references/:id', async (req, res) => {
+app.put('/api/geofence-references/:id', authenticateRequest, async (req, res) => {
   const { id } = req.params;
   const { incoming_name, outgoing_name } = req.body;
 
@@ -1469,7 +1588,7 @@ app.put('/api/geofence-references/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/geofence-references/:id', async (req, res) => {
+app.delete('/api/geofence-references/:id', authenticateRequest, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -1487,7 +1606,7 @@ app.delete('/api/geofence-references/:id', async (req, res) => {
 });
 
 // Geofence References V2 CRUD endpoints (improved architecture)
-app.get('/api/geofence-references-v2', async (req, res) => {
+app.get('/api/geofence-references-v2', authenticateRequest, async (req, res) => {
   try {
     const result = await pool.query(`
       SELECT gr.*, g.name as geofence_name
@@ -1502,7 +1621,7 @@ app.get('/api/geofence-references-v2', async (req, res) => {
   }
 });
 
-app.post('/api/geofence-references-v2', async (req, res) => {
+app.post('/api/geofence-references-v2', authenticateRequest, async (req, res) => {
   const { geofence_id, incoming_names } = req.body;
 
   if (!geofence_id || !Array.isArray(incoming_names) || incoming_names.length === 0) {
@@ -1584,7 +1703,7 @@ app.post('/api/geofence-references-v2', async (req, res) => {
   }
 });
 
-app.put('/api/geofence-references-v2/:id', async (req, res) => {
+app.put('/api/geofence-references-v2/:id', authenticateRequest, async (req, res) => {
   const { id } = req.params;
   const { geofence_id, incoming_names } = req.body;
 
@@ -1671,7 +1790,7 @@ app.put('/api/geofence-references-v2/:id', async (req, res) => {
   }
 });
 
-app.delete('/api/geofence-references-v2/:id', async (req, res) => {
+app.delete('/api/geofence-references-v2/:id', authenticateRequest, async (req, res) => {
   const { id } = req.params;
 
   try {
@@ -1684,42 +1803,6 @@ app.delete('/api/geofence-references-v2/:id', async (req, res) => {
     res.json({ message: 'Geofence reference v2 deleted successfully' });
   } catch (error) {
     console.error('Error deleting geofence reference v2:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-
-app.get('/api/geofence-alerts', async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT
-        ga.time,
-        ga.geofence_id,
-        ga.device_serial,
-        ga.alert,
-        g.name as geofence_name,
-        COALESCE(vi.fleet_number, vi.vehicle_reg, 'Unknown Fleet') as fleet_name
-      FROM geofence_alert_ts ga
-      LEFT JOIN geofences g ON ga.geofence_id::bigint = g.id::bigint
-      LEFT JOIN vehicle_info vi ON ga.device_serial::text = vi.device_serial
-
-      ORDER BY ga.time DESC
-      LIMIT 1000
-    `);
-
-    const alerts = result.rows.map(row => ({
-      id: `${row.geofence_id}-${row.device_serial}-${row.time}`,
-      type: row.alert === 'OUTSIDE GEOFENCE'? 'Exit' : 'Entry', 
-      fleetName: row.fleet_name,
-      geofenceName: row.geofence_name,
-      alertName: row.alert,
-      deviceSerial: row.device_serial,
-      alertTime: new Date(row.time * 1000).toISOString().slice(0, 19).replace('T', ' ')
-    }));
-
-    res.json(alerts);
-  } catch (error) {
-    console.error('Error fetching geofence alerts:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1758,39 +1841,6 @@ app.get('/api/trucks/:device_serial', authenticateRequest, async (req, res) => {
     res.json(result.rows[0]);
   } catch (error) {
     console.error('Error fetching vehicle:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-app.get('/api/trucks/:device_serial/alerts', authenticateRequest, async (req, res) => {
-  try {
-    const { device_serial } = req.params;
-    const { limit = 50 } = req.query;
-    const userCompanyId = req.user.company_id;
-
-    // Verify the vehicle exists and belongs to user's company
-    const vehicleResult = await pool.query(
-      'SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND nex_customer_id = $2',
-      [device_serial, userCompanyId]
-    );
-
-    if (vehicleResult.rows.length === 0) {
-      return res.status(404).json({ error: 'Vehicle not found or access denied' });
-    }
-
-    // Get alerts for this vehicle
-    const alertsResult = await pool.query(
-      `SELECT a.*
-       FROM alert_ts a
-       WHERE a.device_serial::text = $1
-       ORDER BY a.time DESC
-       LIMIT $2`,
-      [device_serial, parseInt(limit)]
-    );
-
-    res.json(alertsResult.rows);
-  } catch (error) {
-    console.error('Error fetching vehicle alerts:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -1967,7 +2017,7 @@ app.get('/api/trucks/:device_serial/trips', authenticateRequest, async (req, res
   }
 });
 
-app.get('/api/ignitionStatus', authenticateRequest, async (req, res) => {
+app.get('/api/ignitionStatus', async (req, res) => {
   try {
     // Check if a specific serial is requested
     const { serial } = req.query;
@@ -2002,46 +2052,6 @@ app.get('/api/ignitionStatus', authenticateRequest, async (req, res) => {
     res.status(500).json({ error: "Database error", details: err.message });
   }
 });
-
-app.get('/api/alerts/latest200', authenticateRequest, async (req, res)=>{
-  try {
-    const userCompanyId = req.user.company_id;
-
-    const result = await pool.query(`
-        SELECT a.*
-        FROM alert_ts a
-        INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial AND vi.nex_customer_id = $1
-        ORDER BY a.time DESC
-        LIMIT 200
-    `, [userCompanyId]);
-    console.log('latest 200 alerts', result.rows.length)
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: "Database error", details: err.message });
-  }
-});
-app.get('/api/alerts/latest', authenticateRequest, async (req, res)=>{
-  try {
-    const userCompanyId = req.user.company_id;
-
-    const result = await pool.query(`
-        SELECT DISTINCT ON (a.device_serial) a.*
-        FROM alert_ts a
-        INNER JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial AND vi.nex_customer_id = $1
-        ORDER BY a.device_serial, a.time DESC
-    `, [userCompanyId]);
-    console.log('latest alerts', result.rows.length)
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: "Database error", details: err.message });
-  }
-});
-
-
-
-
-
-
 
 
 
@@ -2111,79 +2121,6 @@ function generateRandomColor() {
 // Auth routes (including customers)
 
 
-// ---------------- MQTT Logs Routes ---------------- //
-
-app.get('/api/logs/:serial_number/retrieve/stream', (req, res) => {
-  const { serial_number } = req.params;
-  const command = "1";
-  const controlTopic = `ekco/v1/${serial_number}/logs/control`;
-
-  console.log(`[SSE] Setting up stream for serial: ${serial_number}`);
-
-  req.socket.setTimeout(0);
-  res.set({
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-  });
-  res.flushHeaders();
-
-  // Set up activeStreams for the global MQTT handler to use
-  if (!activeStreams[serial_number]) {
-    activeStreams[serial_number] = { logs: [] };
-  }
-  activeStreams[serial_number].logs.push(res);
-  console.log(`[SSE] Added SSE client for serial ${serial_number}. Total clients: ${activeStreams[serial_number].logs.length}`);
-
-  mqttClient.publish(controlTopic, String(command), { retain: false }, (err) => {
-    if (err) {
-      console.error(`[SSE] Failed to publish control command to ${controlTopic}:`, err);
-      res.write(`event: error\ndata: ${JSON.stringify({ error: 'Failed to publish control command', details: err.message })}\n\n`);
-      res.end();
-      // Remove from activeStreams
-      if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
-        activeStreams[serial_number].logs = activeStreams[serial_number].logs.filter(r => r !== res);
-      }
-    } else {
-      console.log(`[SSE] Successfully published start command to ${controlTopic}`);
-      // Send a connection confirmation message
-      res.write(`data: ${JSON.stringify({ topic: 'connection', payload: 'SSE connection established for serial ' + serial_number })}\n\n`);
-    }
-  });
-
-  req.on('close', () => {
-    console.log(`[SSE] SSE connection closed for serial ${serial_number}`);
-    // Remove from activeStreams when connection closes
-    if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
-      activeStreams[serial_number].logs = activeStreams[serial_number].logs.filter(r => r !== res);
-      console.log(`[SSE] Removed SSE client for serial ${serial_number}. Remaining clients: ${activeStreams[serial_number].logs.length}`);
-    }
-  });
-});
-
-app.post('/api/logs/:serial_number/retrieve/stream/stop', (req, res) => {
-  const { serial_number } = req.params;
-  const controlTopic = `ekco/v1/${serial_number}/logs/control`;
-
-  mqttClient.publish(controlTopic, "0", { retain: false }, (err) => {
-    if (err) {
-      console.error(`Failed to send stop command to ${controlTopic}:`, err);
-    }
-  });
-
-  // Close all active SSE streams for this serial
-  if (activeStreams[serial_number] && activeStreams[serial_number].logs) {
-    activeStreams[serial_number].logs.forEach(streamRes => {
-      streamRes.write('event: end\ndata: Stream stopped by server\n\n');
-      streamRes.end();
-    });
-    activeStreams[serial_number].logs = [];
-  }
-
-  // Always 200 OK
-  res.json({ message: `Stop command sent for ${serial_number}` });
-});
-
 //Use the client app
 app.use(express.static(path.join(__dirname, '/client/dist'), {
   setHeaders: (res, path) => {
@@ -2215,42 +2152,54 @@ app.get('/api/lock-status/:serial_number', async (req, res) => {
 });
 
 // Trip reports endpoint - returns multiple trip reports with GPS paths
-app.get('/api/trips/:device_serial', async (req, res) => {
+app.get('/api/trips/:device_serial', authenticateRequest, async (req, res) => {
   const { device_serial } = req.params;
   const { start, end } = req.query;
+  const userCompanyId = req.user.company_id;
+  
   try {
-      let query = "SELECT * FROM trips WHERE device_serial = $1";
-      let params = [device_serial];
+    // First verify the vehicle belongs to the user's company
+    const vehicleCheck = await pool.query(
+      'SELECT device_serial FROM vehicle_info WHERE device_serial = $1 AND nex_customer_id = $2',
+      [device_serial, userCompanyId]
+    );
 
-      if (start && end) {
-          query += " AND start_time >= EXTRACT(EPOCH FROM $2::timestamp) AND end_time <= EXTRACT(EPOCH FROM $3::timestamp)";
-          params = [device_serial, start, end];
-      }
+    if (vehicleCheck.rows.length === 0) {
+      return res.status(404).json({ error: 'Vehicle not found or access denied' });
+    }
 
-      query += " ORDER BY start_time DESC";
+    let query = "SELECT * FROM trips WHERE device_serial = $1";
+    let params = [device_serial];
 
-      const tripsResult = await pool.query(query, params);
-      const tripsWithPath = await Promise.all(
-          tripsResult.rows.map(async (trip) => {
-              const pathResult = await pool.query(
-                  `SELECT
-                    time,
-                    ST_X(location::geometry) AS longitude,
-                    ST_Y(location::geometry) AS latitude,
-                    speed
-                  FROM gps_ts
-                  WHERE device_serial = $1
-                    AND time BETWEEN $2 AND $3
-                  ORDER BY time`,
-                  [device_serial, trip.start_time, trip.end_time]
-              );
-              return {
-                  ...trip,
-                  path: pathResult.rows,
-              };
-          })
-      );
-      res.json(tripsWithPath);
+    if (start && end) {
+        query += " AND start_time >= EXTRACT(EPOCH FROM $2::timestamp) AND end_time <= EXTRACT(EPOCH FROM $3::timestamp)";
+        params = [device_serial, start, end];
+    }
+
+    query += " ORDER BY start_time DESC";
+
+    const tripsResult = await pool.query(query, params);
+    const tripsWithPath = await Promise.all(
+        tripsResult.rows.map(async (trip) => {
+            const pathResult = await pool.query(
+                `SELECT
+                  time,
+                  ST_X(location::geometry) AS longitude,
+                  ST_Y(location::geometry) AS latitude,
+                  speed
+                FROM gps_ts
+                WHERE device_serial = $1
+                  AND time BETWEEN $2 AND $3
+                ORDER BY time`,
+                [device_serial, trip.start_time, trip.end_time]
+            );
+            return {
+                ...trip,
+                path: pathResult.rows,
+            };
+        })
+    );
+    res.json(tripsWithPath);
   } catch (err) {
       res.status(500).json({ error: "Database error", details: err.message });
   }
@@ -2275,14 +2224,22 @@ function calculateDistance(path) {
   return Math.round(totalDistance * 100) / 100; // Round to 2 decimal places
 }
 
-// Helper function to parse WKB POINT string
+// Helper function to parse WKB POINT string with validation
 function parseWKBPoint(wkbString) {
-  const match = wkbString.match(/POINT\(([^ ]+) ([^)]+)\)/);
-  if (match) {
-    return {
-      lng: parseFloat(match[1]),
-      lat: parseFloat(match[2])
-    };
+  try {
+    if (!wkbString || typeof wkbString !== 'string') return null;
+    const match = wkbString.match(/POINT\(([^ ]+) ([^)]+)\)/);
+    if (match) {
+      const lng = parseFloat(match[1]);
+      const lat = parseFloat(match[2]);
+      if (isNaN(lng) || isNaN(lat)) {
+        console.warn('Invalid coordinates in WKB POINT');
+        return null;
+      }
+      return { lng, lat };
+    }
+  } catch (error) {
+    console.error('Error parsing WKB Point:', error.message);
   }
   return null;
 }
@@ -2323,22 +2280,52 @@ app.get('*', (req, res)=>{
 
 
 
-// Function to parse EWKB POINT hex string to lat/lng
+// Function to parse EWKB POINT hex string to lat/lng with validation
 function parseEWKBPoint(hex) {
-  const bytes = new Uint8Array(hex.match(/.{1,2}/g).map(b => parseInt(b, 16)));
-  const view = new DataView(bytes.buffer);
-  let offset = 0;
-  const byteOrder = view.getUint8(offset); offset += 1;
-  const wkbType = view.getUint32(offset, byteOrder === 1); offset += 4;
-  if ((wkbType & 0x1FFFFFFF) === 1) { // POINT
-    if (wkbType & 0x20000000) { // has SRID
-      offset += 4; // skip SRID
+  try {
+    if (!hex || typeof hex !== 'string' || hex.length < 18) {
+      console.warn('Invalid hex data for EWKB parsing');
+      return null;
     }
-    const lng = view.getFloat64(offset, byteOrder === 1); offset += 8;
-    const lat = view.getFloat64(offset, byteOrder === 1);
-    return { lat, lng };
+
+    const bytes = new Uint8Array(hex.match(/.{1,2}/g).map(b => {
+      const val = parseInt(b, 16);
+      if (isNaN(val)) return 0;
+      return val;
+    }));
+
+    if (bytes.length < 21) {
+      console.warn('EWKB data too short:', bytes.length);
+      return null;
+    }
+
+    const view = new DataView(bytes.buffer);
+    let offset = 0;
+    const byteOrder = view.getUint8(offset); offset += 1;
+    const wkbType = view.getUint32(offset, byteOrder === 1); offset += 4;
+    
+    if ((wkbType & 0x1FFFFFFF) === 1) { // POINT
+      if (wkbType & 0x20000000) { // has SRID
+        offset += 4; // skip SRID
+      }
+      if (offset + 16 > bytes.length) {
+        console.warn('Not enough data for point coordinates');
+        return null;
+      }
+      const lng = view.getFloat64(offset, byteOrder === 1); offset += 8;
+      const lat = view.getFloat64(offset, byteOrder === 1);
+      if (isNaN(lat) || isNaN(lng)) {
+        console.warn('Invalid coordinates parsed from EWKB');
+        return null;
+      }
+      return { lat, lng };
+    }
+    console.warn('Not a POINT geometry type');
+    return null;
+  } catch (error) {
+    console.error('Error parsing EWKB Point:', error.message);
+    return null;
   }
-  throw new Error('Not a POINT geometry');
 }
 
 
@@ -2383,10 +2370,11 @@ async function broadcastAlerts() {
 
         const result = await pool.query(
             `
-            SELECT time::bigint AS time, device_serial, alert 
-            FROM alert_ts 
-            WHERE time::bigint > $1 
-            ORDER BY time DESC
+            SELECT a.time::bigint AS time, a.device_serial, a.alert, vi.nex_customer_id
+            FROM alert_ts a
+            LEFT JOIN vehicle_info vi ON a.device_serial::text = vi.device_serial
+            WHERE a.time::bigint > $1 
+            ORDER BY a.time DESC
             `,
             [latestAlertTimestamp]
         );
@@ -2438,9 +2426,23 @@ async function broadcastAlerts() {
 
             latestAlertTimestamp = maxTime + 1;
 
-            broadcast({
-                type: "alert_update",
-                data: filteredAlerts,
+            // Group alerts by company and broadcast to each company separately
+            const alertsByCompany = {};
+            filteredAlerts.forEach(alert => {
+                const companyId = alert.nex_customer_id;
+                if (companyId) {
+                    if (!alertsByCompany[companyId]) alertsByCompany[companyId] = [];
+                    // Don't include nex_customer_id in the data sent to client
+                    const { nex_customer_id, ...alertData } = alert;
+                    alertsByCompany[companyId].push(alertData);
+                }
+            });
+            
+            Object.entries(alertsByCompany).forEach(([companyId, alerts]) => {
+                broadcast({
+                    type: "alert_update",
+                    data: alerts,
+                }, companyId);
             });
         } else {
             // All valid, but filtered out as unimportant
@@ -2579,9 +2581,9 @@ let latestGeofenceAlertTimestamp = Math.floor(Date.now() / 1000) - 60;
 // Store the timestamp of the last sent engine status update
 let latestEngineStatusTimestamp = Math.floor(Date.now() / 1000) - 60;
 
-// Function to broadcast a single geofence alert
-function broadcastSingleAlert(alert) {
-  console.log('📡 Broadcasting geofence alert:', alert);
+// Function to broadcast a single geofence alert (filtered by company)
+function broadcastSingleAlert(alert, companyId) {
+  console.log('📡 Broadcasting geofence alert to company:', companyId, 'alert:', alert);
 
   if (!wss || !wss.clients) {
     console.warn('WebSocket server not initialized yet or clients not available');
@@ -2594,7 +2596,10 @@ function broadcastSingleAlert(alert) {
   });
 
   wss.clients.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
+    // Only send to clients authenticated for this company
+    if (client.readyState === WebSocket.OPEN && 
+        client.company_id && 
+        client.company_id === companyId) {
       client.send(message);
     }
   });
@@ -2613,7 +2618,8 @@ async function checkAndBroadcastNewGeofenceAlerts() {
         ga.device_serial,
         ga.alert,
         g.name as geofence_name,
-        COALESCE(vi.fleet_number, vi.vehicle_reg, 'Unknown Fleet') as fleet_name
+        COALESCE(vi.fleet_number, vi.vehicle_reg, 'Unknown Fleet') as fleet_name,
+        vi.nex_customer_id as company_id
       FROM geofence_alert_ts ga
       LEFT JOIN geofences g ON ga.geofence_id::bigint = g.id::bigint
       LEFT JOIN vehicle_info vi ON ga.device_serial::text = vi.device_serial
@@ -2649,7 +2655,8 @@ async function checkAndBroadcastNewGeofenceAlerts() {
       geofenceName: row.geofence_name,
       alertName: row.alert,
       deviceSerial: row.device_serial,
-      alertTime: new Date(row.time * 1000).toISOString().slice(0, 19).replace('T', ' ')
+      alertTime: new Date(row.time * 1000).toISOString().slice(0, 19).replace('T', ' '),
+      company_id: row.company_id
     }));
 
     // Update timestamp to the latest alert time + 1
@@ -2658,9 +2665,9 @@ async function checkAndBroadcastNewGeofenceAlerts() {
 
     console.log("📤 Broadcasting new geofence alerts:", newAlerts.length);
 
-    // Broadcast each new alert
+    // Broadcast each new alert to its company
     newAlerts.forEach(alert => {
-      broadcastSingleAlert(alert);
+      broadcastSingleAlert(alert, alert.company_id);
     });
 
   } catch (error) {
@@ -2675,12 +2682,14 @@ async function checkAndBroadcastEngineStatusUpdates() {
 
     const result = await pool.query(`
       SELECT
-        device_serial,
-        time,
-        ignition_status
-      FROM engine_ts
-      WHERE time > $1
-      ORDER BY time DESC
+        e.device_serial,
+        e.time,
+        e.ignition_status,
+        vi.nex_customer_id
+      FROM engine_ts e
+      LEFT JOIN vehicle_info vi ON e.device_serial::text = vi.device_serial
+      WHERE e.time > $1
+      ORDER BY e.time DESC
     `, [latestEngineStatusTimestamp]);
 
     if (result.rows.length === 0) {
@@ -2731,10 +2740,23 @@ async function checkAndBroadcastEngineStatusUpdates() {
     const maxTime = Math.max(...validUpdates.map(r => parseInt(r.time)));
     latestEngineStatusTimestamp = maxTime + 1;
 
-    // Broadcast engine status updates
-    broadcast({
-      type: "engine_status_update",
-      data: engineUpdates
+    // Group updates by company and broadcast to each company separately
+    const updatesByCompany = {};
+    engineUpdates.forEach(update => {
+        // Find the corresponding raw update to get company_id
+        const rawUpdate = validUpdates.find(v => v.device_serial === update.device_serial);
+        if (rawUpdate && rawUpdate.nex_customer_id) {
+            const companyId = rawUpdate.nex_customer_id;
+            if (!updatesByCompany[companyId]) updatesByCompany[companyId] = [];
+            updatesByCompany[companyId].push(update);
+        }
+    });
+    
+    Object.entries(updatesByCompany).forEach(([companyId, updates]) => {
+        broadcast({
+            type: "engine_status_update",
+            data: updates
+        }, companyId);
     });
 
   } catch (error) {
