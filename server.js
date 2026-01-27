@@ -252,7 +252,8 @@ async function initializeDatabase() {
     console.log('✅ Database initialization completed');
   } catch (error) {
     console.error('❌ Database initialization failed:', error);
-    process.exit(1);
+    console.log('⚠️ Continuing server startup despite database initialization failure');
+    // Don't exit - allow server to start without database
   } finally {
     global.databaseInitializing = false;
   }
@@ -286,16 +287,21 @@ async function startServer() {
       ws.on('message', (message) => {
         try {
           const data = JSON.parse(message);
-          
+
           // If client sends auth message with their company_id
           if (data.type === 'auth') {
             ws.company_id = data.company_id;
             console.log('🔐 WebSocket client authenticated for company:', ws.company_id);
+            // Send confirmation back to client
+            ws.send(JSON.stringify({
+              type: 'auth_success',
+              company_id: ws.company_id
+            }));
           } else {
             console.log('Received:', message);
           }
         } catch (err) {
-          console.log('Received:', message);
+          console.log('Received non-JSON message:', message);
         }
       });
 
@@ -772,8 +778,6 @@ app.post('/api/logs/:serial_number/retrieve/stream/stop', (req, res) => {
 });
 
 
-
-
 app.get('/api/geofences/for-serial', async (req, res) => {
 
   const serial = req.headers.serial;
@@ -821,48 +825,6 @@ app.get('/api/geofences/for-serial', async (req, res) => {
 
 
 
-
-
-// -------- Protected Routes (Auth Required) -------- //
-
-
-
-
-
-app.use('/api', authenticateRequest, deviceHealthRoutes);
-
-
-
-app.get('/api/geofences', authenticateRequest, async (req, res) => {
-  try {
-    const userCompanyId = req.user.company_id;
-    console.log("Fetching geofences for company:", userCompanyId);
-
-    const result = await pool.query(
-      'SELECT id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords FROM geofences WHERE company_id = $1 ORDER BY id',
-      [userCompanyId]
-    );
-
-    const geofences = result.rows.map(row => {
-
-      let trucks = row.trucks;
-      if (!Array.isArray(trucks)) {
-        trucks = [];
-      } else {
-        trucks = trucks.map(n => (typeof n === 'number' ? n : parseInt(n, 10))).filter(v => !Number.isNaN(v));
-      }
-      return { ...row, trucks, shape: row.shape || 'circle', polygon_coords: row.polygon_coords };
-    });
-    res.json(geofences);
-  } catch (error) {
-    console.error('Error fetching geofences:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-
-
-
 app.get('/api/geofences/for-serial-test', async (req, res) => {
 
   const serial = req.headers.serial;
@@ -903,6 +865,50 @@ app.get('/api/geofences/for-serial-test', async (req, res) => {
     res.json(dataMapped);
   } catch (error) {
     console.error('Error fetching geofences for truck id', truckId, error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
+
+
+
+
+// -------- Protected Routes (Auth Required) -------- //
+
+
+
+
+
+
+
+app.use('/api', authenticateRequest, deviceHealthRoutes);
+
+
+
+app.get('/api/geofences', authenticateRequest, async (req, res) => {
+  try {
+    const userCompanyId = req.user.company_id;
+    console.log("Fetching geofences for company:", userCompanyId);
+
+    const result = await pool.query(
+      'SELECT id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords FROM geofences WHERE company_id = $1 ORDER BY id',
+      [userCompanyId]
+    );
+
+    const geofences = result.rows.map(row => {
+
+      let trucks = row.trucks;
+      if (!Array.isArray(trucks)) {
+        trucks = [];
+      } else {
+        trucks = trucks.map(n => (typeof n === 'number' ? n : parseInt(n, 10))).filter(v => !Number.isNaN(v));
+      }
+      return { ...row, trucks, shape: row.shape || 'circle', polygon_coords: row.polygon_coords };
+    });
+    res.json(geofences);
+  } catch (error) {
+    console.error('Error fetching geofences:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
