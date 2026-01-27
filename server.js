@@ -771,42 +771,7 @@ app.post('/api/logs/:serial_number/retrieve/stream/stop', (req, res) => {
   res.json({ message: `Stop command sent for ${serial_number}` });
 });
 
-// -------- Protected Routes (Auth Required) -------- //
 
-
-
-
-
-app.use('/api', authenticateRequest, deviceHealthRoutes);
-
-
-
-app.get('/api/geofences', authenticateRequest, async (req, res) => {
-  try {
-    const userCompanyId = req.user.company_id;
-    console.log("Fetching geofences for company:", userCompanyId);
-
-    const result = await pool.query(
-      'SELECT id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords FROM geofences WHERE company_id = $1 ORDER BY id',
-      [userCompanyId]
-    );
-
-    const geofences = result.rows.map(row => {
-
-      let trucks = row.trucks;
-      if (!Array.isArray(trucks)) {
-        trucks = [];
-      } else {
-        trucks = trucks.map(n => (typeof n === 'number' ? n : parseInt(n, 10))).filter(v => !Number.isNaN(v));
-      }
-      return { ...row, trucks, shape: row.shape || 'circle', polygon_coords: row.polygon_coords };
-    });
-    res.json(geofences);
-  } catch (error) {
-    console.error('Error fetching geofences:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
 
 
 app.get('/api/geofences/for-serial', async (req, res) => {
@@ -852,6 +817,50 @@ app.get('/api/geofences/for-serial', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+
+
+
+
+
+// -------- Protected Routes (Auth Required) -------- //
+
+
+
+
+
+app.use('/api', authenticateRequest, deviceHealthRoutes);
+
+
+
+app.get('/api/geofences', authenticateRequest, async (req, res) => {
+  try {
+    const userCompanyId = req.user.company_id;
+    console.log("Fetching geofences for company:", userCompanyId);
+
+    const result = await pool.query(
+      'SELECT id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords FROM geofences WHERE company_id = $1 ORDER BY id',
+      [userCompanyId]
+    );
+
+    const geofences = result.rows.map(row => {
+
+      let trucks = row.trucks;
+      if (!Array.isArray(trucks)) {
+        trucks = [];
+      } else {
+        trucks = trucks.map(n => (typeof n === 'number' ? n : parseInt(n, 10))).filter(v => !Number.isNaN(v));
+      }
+      return { ...row, trucks, shape: row.shape || 'circle', polygon_coords: row.polygon_coords };
+    });
+    res.json(geofences);
+  } catch (error) {
+    console.error('Error fetching geofences:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+
 
 
 app.get('/api/geofences/for-serial-test', async (req, res) => {
