@@ -1128,10 +1128,10 @@ app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
     // Clear all trucks before bulk import (original behavior)
     try {
       await client.query(
-        'UPDATE geofences SET trucks = $1 WHERE id != $2',
-        [[], 51]
+        'UPDATE geofences SET trucks = $1 WHERE id != $2 AND company_id != $3',
+        [[], 51, 5]
       );
-      console.log("Cleared trucks for all geofences except ID 51");
+      console.log("Cleared trucks for all geofences except ID 51 and those with company_id = 5");
     } catch (err) {
       console.error("Error clearing existing trucks before bulk import:", err);
       throw err;
