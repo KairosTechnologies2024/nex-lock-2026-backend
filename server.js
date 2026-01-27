@@ -1114,7 +1114,7 @@ app.delete('/api/geofences/:id', authenticateRequest, async (req, res) => {
 
 
 
-app.post('/api/geofences/bulk', async (req, res) => {
+app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
   const geofences = req.body;
 
   if (!Array.isArray(geofences) || geofences.length === 0) {
@@ -1377,7 +1377,7 @@ app.post('/api/geofences/bulk', async (req, res) => {
 
 
 // City Dictionary endpoint - creates geofences without truck assignments
-app.post('/api/geofences/city-dictionary', async (req, res) => {
+app.post('/api/geofences/city-dictionary', authenticateRequest, async (req, res) => {
   const geofences = req.body;
 
   if (!Array.isArray(geofences) || geofences.length === 0) {
