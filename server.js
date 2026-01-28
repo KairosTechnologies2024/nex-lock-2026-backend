@@ -1250,7 +1250,7 @@ app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
         if (nameCheck.rows.length > 0) {
           existingGeofence = nameCheck.rows[0];
         } else {
-          // Check for duplicate centre point
+          // Check for duplicate centre point (company-scoped)
           const pointCheck = await client.query('SELECT id, trucks FROM geofences WHERE lat = $1 AND lng = $2 AND company_id = $3', [lat, lng, userCompanyId]);
           if (pointCheck.rows.length > 0) {
             existingGeofence = pointCheck.rows[0];
