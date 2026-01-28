@@ -938,21 +938,21 @@ app.post('/api/geofences', authenticateRequest, async (req, res) => {
 
   try {
 
-    const nameCheck = await pool.query('SELECT id FROM geofences WHERE name = $1', [name]);
+    const nameCheck = await pool.query('SELECT id FROM geofences WHERE name = $1 AND company_id = $2', [name, userCompanyId]);
     if (nameCheck.rows.length > 0) {
       return res.status(400).json({ error: 'Geofence name already exists. Please choose a different name.' });
     }
 
-  
+
     if (normalizedShape === 'circle') {
-      const pointCheck = await pool.query('SELECT id FROM geofences WHERE lat = $1 AND lng = $2', [baseLat, baseLng]);
+      const pointCheck = await pool.query('SELECT id FROM geofences WHERE lat = $1 AND lng = $2 AND company_id = $3', [baseLat, baseLng, userCompanyId]);
       if (pointCheck.rows.length > 0) {
         return res.status(400).json({ error: 'Geofence with the same centre point already exists. Please choose a different location.' });
       }
 
       const overlapCheck = await pool.query(
-        'SELECT id FROM geofences WHERE shape = $4 AND (111.32 * COS(RADIANS(lat)) * (lng - $1)) ^ 2 + (111.32 * (lat - $2)) ^ 2 <= ((radius_km + $3) * 1000 / 1000) ^ 2',
-        [baseLng, baseLat, radiusKm, 'circle']
+        'SELECT id FROM geofences WHERE shape = $4 AND company_id = $5 AND (111.32 * COS(RADIANS(lat)) * (lng - $1)) ^ 2 + (111.32 * (lat - $2)) ^ 2 <= ((radius_km + $3) * 1000 / 1000) ^ 2',
+        [baseLng, baseLat, radiusKm, 'circle', userCompanyId]
       );
 
       if (overlapCheck.rows.length > 0) {
@@ -1127,17 +1127,18 @@ app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
     return res.status(400).json({ error: 'Invalid geofences data' });
   }
 
+  const userCompanyId = req.user.company_id;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
-    // Clear all trucks before bulk import (original behavior)
+    // Clear trucks only for this company before bulk import
     try {
       await client.query(
-        'UPDATE geofences SET trucks = $1 WHERE id != $2 AND company_id != $3',
-        [[], 51, 5]
+        'UPDATE geofences SET trucks = $1 WHERE company_id = $2',
+        [[], userCompanyId]
       );
-      console.log("Cleared trucks for all geofences except ID 51 and those with company_id = 5");
+      console.log(`Cleared trucks for company ${userCompanyId}`);
     } catch (err) {
       console.error("Error clearing existing trucks before bulk import:", err);
       throw err;
@@ -1159,24 +1160,22 @@ app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
         const radiusKm = radius / 1000;
         const centrePoint = `POINT(${lng} ${lat})`;
 
-        // Normalize incoming trucks to canonical device_serial values (and create missing vehicle_info rows)
         // Normalize incoming trucks to canonical device_serial values.
         // Do NOT create missing vehicle_info rows; if any identifiers are unknown, skip this geofence entry.
         const { normalized: processedNewTrucks, missing: missingIdentifiers } = await normalizeTruckIdentifiers(client, Array.isArray(trucks) ? trucks : []);
 
-        // If there are missing identifiers, skip this geofence and record an error to avoid creating blank/invalid geofences.
         if (missingIdentifiers && missingIdentifiers.length > 0) {
           errors.push(`Geofence "${name}": unknown truck identifiers: ${missingIdentifiers.join(', ')}`);
           continue;
         }
 
-        // FIRST: Check if the incoming geofence center point falls inside any existing polygon geofence
-        // Use pool connection (not client) to avoid transaction issues
+        // Check if point falls inside any existing polygon geofence for this company
         console.log(`🔍 Checking if point (${lat}, ${lng}) for "${name}" falls inside any existing polygons...`);
         let containingPolygon = null;
         try {
           const allPolygons = await pool.query(
-            'SELECT id, trucks, name, polygon_coords FROM geofences WHERE shape = \'polygon\' AND polygon_coords IS NOT NULL'
+            'SELECT id, trucks, name, polygon_coords FROM geofences WHERE shape = \'polygon\' AND polygon_coords IS NOT NULL AND company_id = $1',
+            [userCompanyId]
           );
           console.log(`📐 Found ${allPolygons.rows.length} existing polygons to check against`);
 
@@ -1185,72 +1184,51 @@ app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
               console.log(`🔸 Checking polygon "${polygon.name}" (ID: ${polygon.id})`);
               const coords = polygon.polygon_coords;
               if (Array.isArray(coords) && coords.length >= 3) {
-                console.log(`   Polygon has ${coords.length} coordinates`);
-                // Validate and convert coordinates
                 const validCoords = coords.filter(p =>
                   p && typeof p.lat === 'number' && typeof p.lng === 'number' &&
                   !isNaN(p.lat) && !isNaN(p.lng) &&
                   p.lat >= -90 && p.lat <= 90 && p.lng >= -180 && p.lng <= 180
                 );
-                console.log(`   Valid coordinates: ${validCoords.length}/${coords.length}`);
 
                 if (validCoords.length >= 3) {
-                  // Convert stored format [{lat, lng}, ...] to [[lng, lat], ...] for PostGIS
                   const polygonCoords = validCoords.map(p => `(${p.lng} ${p.lat})`).join(', ');
-                  const polygonWKT = `POLYGON((${polygonCoords}, ${validCoords[0].lng} ${validCoords[0].lat}))`; // Close the polygon
-                  console.log(`   Generated WKT: ${polygonWKT.substring(0, 100)}...`);
-                  console.log(`   Testing point: POINT(${lng} ${lat})`);
+                  const polygonWKT = `POLYGON((${polygonCoords}, ${validCoords[0].lng} ${validCoords[0].lat}))`;
 
                   const pointCheck = await pool.query(
                     'SELECT ST_Contains(ST_GeomFromText($1, 4326), ST_GeomFromText($2, 4326)) as contains',
                     [polygonWKT, `POINT(${lng} ${lat})`]
                   );
 
-                  console.log(`   Containment result: ${pointCheck.rows[0]?.contains}`);
                   if (pointCheck.rows.length > 0 && pointCheck.rows[0].contains) {
-                    console.log(`   ✅ Point is inside polygon "${polygon.name}"!`);
                     containingPolygon = polygon;
                     break;
                   }
-                } else {
-                  console.log(`   ❌ Not enough valid coordinates (${validCoords.length})`);
                 }
-              } else {
-                console.log(`   ❌ Invalid coordinates array or not enough points`);
               }
             } catch (err) {
               console.warn(`Error checking polygon ${polygon.id}:`, err.message);
-              // Continue to next polygon
             }
           }
-          console.log(containingPolygon ? `✅ Point falls inside polygon "${containingPolygon.name}"` : `❌ Point (${lat}, ${lng}) for "${name}" does not fall inside any existing polygons`);
         } catch (err) {
           console.warn('Error fetching polygons for containment check:', err.message);
-          // Continue without polygon checking if there's an error
         }
 
         if (containingPolygon) {
-          // Found an existing polygon geofence that contains this point — merge trucks into it
-          console.log(`🔄 Merging trucks for "${name}" into existing polygon "${containingPolygon.name}"`);
+          // Merge trucks into the containing polygon (same company)
           const polygonParent = containingPolygon;
           const parentTrucks = Array.isArray(polygonParent.trucks) ? polygonParent.trucks.map(String) : [];
           const incomingTrucks = processedNewTrucks.map(String);
-
-          // Merge and deduplicate
           const mergedTrucks = [...new Set([...parentTrucks, ...incomingTrucks])];
 
           try {
             const updatePolygon = await client.query(
-              'UPDATE geofences SET trucks = $1 WHERE id = $2 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords',
-              [mergedTrucks, polygonParent.id]
+              'UPDATE geofences SET trucks = $1 WHERE id = $2 AND company_id = $3 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords',
+              [mergedTrucks, polygonParent.id, userCompanyId]
             );
 
             if (updatePolygon.rows.length > 0) {
               const updatedPolygon = updatePolygon.rows[0];
               updatedGeofences.push({ ...updatedPolygon, trucks: mergedTrucks });
-              console.log(`✅ Successfully merged trucks into polygon "${polygonParent.name}"`);
-
-              // Track affected trucks (old parent trucks + incoming)
               parentTrucks.forEach(t => allAffectedTrucks.add(t));
               incomingTrucks.forEach(t => allAffectedTrucks.add(t));
             } else {
@@ -1261,20 +1239,19 @@ app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
             errors.push(`Failed to merge trucks into containing polygon "${polygonParent.name}" for ${name}: ${err && err.message ? err.message : err}`);
           }
 
-          // Do not create a new geofence for this contained entry; continue processing next input
           continue;
         }
 
-        // If we get here, the point is not inside any polygon, so proceed with normal duplicate checking
+        // Proceed with duplicate checking within company scope
         let existingGeofence = null;
 
         // Check for duplicate name
-        const nameCheck = await client.query('SELECT id, trucks FROM geofences WHERE name = $1', [name]);
+        const nameCheck = await client.query('SELECT id, trucks FROM geofences WHERE name = $1 AND company_id = $2', [name, userCompanyId]);
         if (nameCheck.rows.length > 0) {
           existingGeofence = nameCheck.rows[0];
         } else {
           // Check for duplicate centre point
-          const pointCheck = await client.query('SELECT id, trucks FROM geofences WHERE lat = $1 AND lng = $2', [lat, lng]);
+          const pointCheck = await client.query('SELECT id, trucks FROM geofences WHERE lat = $1 AND lng = $2 AND company_id = $3', [lat, lng, userCompanyId]);
           if (pointCheck.rows.length > 0) {
             existingGeofence = pointCheck.rows[0];
           }
@@ -1283,52 +1260,43 @@ app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
         if (existingGeofence) {
           const oldTrucks = Array.isArray(existingGeofence.trucks) ? existingGeofence.trucks.map(String) : [];
 
-          // Always overwrite the trucks list with the processed incoming list.
-          // An explicit empty list or an omitted trucks field will now clear existing trucks.
           const result = await client.query(
-            'UPDATE geofences SET trucks = $1 WHERE id = $2 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
-            [processedNewTrucks, existingGeofence.id]
+            'UPDATE geofences SET trucks = $1 WHERE id = $2 AND company_id = $3 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
+            [processedNewTrucks, existingGeofence.id, userCompanyId]
           );
 
           if (result.rows.length > 0) {
             const updatedGeofence = result.rows[0];
             updatedGeofences.push({ ...updatedGeofence, trucks: processedNewTrucks });
-
-            // Track affected trucks (old and new) so MQTT notifications go out
             oldTrucks.forEach(t => allAffectedTrucks.add(t));
             processedNewTrucks.forEach(t => allAffectedTrucks.add(t));
           }
         } else {
-          // Check for overlap with existing geofences. If overlap found, merge incoming trucks into the nearest parent geofence
+          // Overlap with existing geofences for the same company
           const overlapCheck = await client.query(
             `SELECT id, trucks
              FROM geofences
-             WHERE ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, (radius_km + $3) * 1000)
+             WHERE company_id = $4 AND ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, (radius_km + $3) * 1000)
              ORDER BY ST_Distance(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography)
              LIMIT 1`,
-            [lng, lat, radiusKm]
+            [lng, lat, radiusKm, userCompanyId]
           );
 
           if (overlapCheck.rows.length > 0) {
-            // Found an existing parent/overlapping geofence — merge trucks into it instead of creating a nested geofence
             const parent = overlapCheck.rows[0];
             const parentTrucks = Array.isArray(parent.trucks) ? parent.trucks.map(String) : [];
             const incomingTrucks = processedNewTrucks.map(String);
-
-            // Merge and deduplicate
             const mergedTrucks = [...new Set([...parentTrucks, ...incomingTrucks])];
 
             try {
               const updateParent = await client.query(
-                'UPDATE geofences SET trucks = $1 WHERE id = $2 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
-                [mergedTrucks, parent.id]
+                'UPDATE geofences SET trucks = $1 WHERE id = $2 AND company_id = $3 RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
+                [mergedTrucks, parent.id, userCompanyId]
               );
 
               if (updateParent.rows.length > 0) {
                 const updatedParent = updateParent.rows[0];
                 updatedGeofences.push({ ...updatedParent, trucks: mergedTrucks });
-
-                // Track affected trucks (old parent trucks + incoming)
                 parentTrucks.forEach(t => allAffectedTrucks.add(t));
                 incomingTrucks.forEach(t => allAffectedTrucks.add(t));
               } else {
@@ -1339,14 +1307,13 @@ app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
               errors.push(`Failed to merge trucks into overlapping geofence (parent id ${parent.id}) for ${name}: ${err && err.message ? err.message : err}`);
             }
 
-            // Do not create a new geofence for this overlapping entry; continue processing next input
             continue;
           }
 
-          // Create new geofence using processed truck list
+          // Create new geofence for this company
           const insertResult = await client.query(
-            'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8)) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
-            [name, lat, lng, radiusKm, active, processedNewTrucks, generateRandomColor(), centrePoint]
+            'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point, company_id) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8), $9) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color',
+            [name, lat, lng, radiusKm, active, processedNewTrucks, generateRandomColor(), centrePoint, userCompanyId]
           );
 
           if (insertResult.rows.length > 0) {
@@ -1363,7 +1330,6 @@ app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
 
     await client.query('COMMIT');
 
-    // Send MQTT update to all affected trucks
     await sendGeofenceUpdate(Array.from(allAffectedTrucks));
 
     res.status(200).json({
@@ -1390,6 +1356,7 @@ app.post('/api/geofences/city-dictionary', authenticateRequest, async (req, res)
     return res.status(400).json({ error: 'Invalid city dictionary data' });
   }
 
+  const userCompanyId = req.user.company_id;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1410,7 +1377,6 @@ app.post('/api/geofences/city-dictionary', authenticateRequest, async (req, res)
         let shape, lat, lng, polygonCoords = null;
 
         if (wkt.startsWith('POINT')) {
-          // Parse POINT (lng lat)
           const pointMatch = wkt.match(/POINT\s*\(\s*([-\d.]+)\s+([-\d.]+)\s*\)/i);
           if (!pointMatch) {
             errors.push(`Invalid POINT WKT for ${name}: ${wkt}`);
@@ -1418,9 +1384,8 @@ app.post('/api/geofences/city-dictionary', authenticateRequest, async (req, res)
           }
           lng = parseFloat(pointMatch[1]);
           lat = parseFloat(pointMatch[2]);
-          shape = radius > 0 ? 'circle' : 'polygon'; // Use radius to determine shape
+          shape = radius > 0 ? 'circle' : 'polygon';
         } else if (wkt.startsWith('POLYGON')) {
-          // Parse POLYGON ((lng1 lat1, lng2 lat2, ...))
           const polygonMatch = wkt.match(/POLYGON\s*\(\(\s*([^)]+)\s*\)\)/i);
           if (!polygonMatch) {
             errors.push(`Invalid POLYGON WKT for ${name}: ${wkt}`);
@@ -1450,7 +1415,6 @@ app.post('/api/geofences/city-dictionary', authenticateRequest, async (req, res)
           }
 
           shape = 'polygon';
-          // Calculate centroid for polygon
           const centroid = calculatePolygonCentroid(polygonCoords);
           lat = centroid.lat;
           lng = centroid.lng;
@@ -1459,16 +1423,16 @@ app.post('/api/geofences/city-dictionary', authenticateRequest, async (req, res)
           continue;
         }
 
-        // Check for duplicate name
-        const nameCheck = await client.query('SELECT id FROM geofences WHERE name = $1', [name]);
+        // Check for duplicate name within company
+        const nameCheck = await client.query('SELECT id FROM geofences WHERE name = $1 AND company_id = $2', [name, userCompanyId]);
         if (nameCheck.rows.length > 0) {
           errors.push(`Geofence name already exists: ${name}`);
           continue;
         }
 
-        // For circles, check for duplicate center point and overlaps
         if (shape === 'circle' && radius > 0) {
-          const pointCheck = await client.query('SELECT id FROM geofences WHERE lat = $1 AND lng = $2', [lat, lng]);
+          // Company-scoped duplicate center point and overlap checks
+          const pointCheck = await client.query('SELECT id FROM geofences WHERE lat = $1 AND lng = $2 AND company_id = $3', [lat, lng, userCompanyId]);
           if (pointCheck.rows.length > 0) {
             errors.push(`Geofence with same center point already exists: ${name}`);
             continue;
@@ -1478,8 +1442,8 @@ app.post('/api/geofences/city-dictionary', authenticateRequest, async (req, res)
           const centrePoint = `POINT(${lng} ${lat})`;
 
           const overlapCheck = await client.query(
-            'SELECT id FROM geofences WHERE ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, (radius_km + $3) * 1000)',
-            [lng, lat, radiusKm]
+            'SELECT id FROM geofences WHERE company_id = $4 AND ST_DWithin(centre_point, ST_SetSRID(ST_MakePoint($1, $2), 4326)::geography, (radius_km + $3) * 1000)',
+            [lng, lat, radiusKm, userCompanyId]
           );
 
           if (overlapCheck.rows.length > 0) {
@@ -1487,23 +1451,23 @@ app.post('/api/geofences/city-dictionary', authenticateRequest, async (req, res)
             continue;
           }
 
-          // Create circle geofence
+          // Create circle geofence with company_id
           const result = await client.query(
-            'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point, shape) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8), $9) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape',
-            [name, lat, lng, radiusKm, true, [], generateRandomColor(), centrePoint, shape]
+            'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point, shape, company_id) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8), $9, $10) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape',
+            [name, lat, lng, radiusKm, true, [], generateRandomColor(), centrePoint, shape, userCompanyId]
           );
 
           if (result.rows.length > 0) {
             createdGeofences.push(result.rows[0]);
           }
         } else if (shape === 'polygon' && polygonCoords) {
-          // Create polygon geofence
-          const radiusKm = 0; // Polygons don't have radius
-          const centrePoint = `POINT(${lng} ${lat})`; // Use centroid
+          // Create polygon geofence with company_id
+          const radiusKm = 0;
+          const centrePoint = `POINT(${lng} ${lat})`;
 
           const result = await client.query(
-            'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point, shape, polygon_coords) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8), $9, $10) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords',
-            [name, lat, lng, radiusKm, true, [], generateRandomColor(), centrePoint, shape, JSON.stringify(polygonCoords)]
+            'INSERT INTO geofences (name, lat, lng, radius_km, active, trucks, color, centre_point, shape, polygon_coords, company_id) VALUES ($1, $2, $3, $4, $5, $6, $7, ST_GeogFromText($8), $9, $10, $11) RETURNING id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords',
+            [name, lat, lng, radiusKm, true, [], generateRandomColor(), centrePoint, shape, JSON.stringify(polygonCoords), userCompanyId]
           );
 
           if (result.rows.length > 0) {
@@ -1526,6 +1490,7 @@ app.post('/api/geofences/city-dictionary', authenticateRequest, async (req, res)
       errors: errors
     });
 
+    
   } catch (error) {
     await client.query('ROLLBACK');
     console.error('Error in city dictionary processing:', error);
