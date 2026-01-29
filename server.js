@@ -876,7 +876,7 @@ app.get('/api/geofences', authenticateRequest, async (req, res) => {
     console.log("Fetching geofences for company:", userCompanyId);
 
     const result = await pool.query(
-      'SELECT id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords FROM geofences WHERE company_id = $1 ORDER BY id',
+      'SELECT id, name, lat, lng, radius_km * 1000 as radius, active, trucks, color, shape, polygon_coords, company_id FROM geofences WHERE company_id = $1 ORDER BY id',
       [userCompanyId]
     );
 
