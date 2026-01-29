@@ -1132,13 +1132,19 @@ app.post('/api/geofences/bulk', authenticateRequest, async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    // Clear trucks only for this company before bulk import
+    // Clear trucks only for this company before bulk import, with exceptions:
+    // - Never clear any geofences for company 5
+    // - Never clear geofence with id 51 for any company
     try {
-      await client.query(
-        'UPDATE geofences SET trucks = $1 WHERE company_id = $2',
-        [[], userCompanyId]
-      );
-      console.log(`Cleared trucks for company ${userCompanyId}`);
+      if (userCompanyId !== 5) {
+        await client.query(
+          'UPDATE geofences SET trucks = $1 WHERE company_id = $2 AND id != 51',
+          [[], userCompanyId]
+        );
+        console.log(`Cleared trucks for company ${userCompanyId}, excluding protected geofences`);
+      } else {
+        console.log('Skipping truck clearing for company 5 (protected)');
+      }
     } catch (err) {
       console.error("Error clearing existing trucks before bulk import:", err);
       throw err;
