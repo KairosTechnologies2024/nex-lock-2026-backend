@@ -870,23 +870,7 @@ app.get('/api/geofences/for-serial-test', async (req, res) => {
 });
 
 
-
-
-
-
-// -------- Protected Routes (Auth Required) -------- //
-
-
-
-
-
-
-
-app.use('/api', authenticateRequest, deviceHealthRoutes);
-
-
-
-app.get('/api/geofences', authenticateRequest, async (req, res) => {
+app.get('/api/geofences', async (req, res) => {
   try {
     const userCompanyId = req.user.company_id;
     console.log("Fetching geofences for company:", userCompanyId);
@@ -912,6 +896,22 @@ app.get('/api/geofences', authenticateRequest, async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+
+
+// -------- Protected Routes (Auth Required) -------- //
+
+
+
+
+
+
+
+app.use('/api', authenticateRequest, deviceHealthRoutes);
+
+
+
+
 
 
 
