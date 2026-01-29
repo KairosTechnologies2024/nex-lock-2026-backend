@@ -870,7 +870,7 @@ app.get('/api/geofences/for-serial-test', async (req, res) => {
 });
 
 
-app.get('/api/geofences', async (req, res) => {
+app.get('/api/geofences', authenticateRequest, async (req, res) => {
   try {
     const userCompanyId = req.user.company_id;
     console.log("Fetching geofences for company:", userCompanyId);
