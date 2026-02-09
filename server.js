@@ -13,27 +13,13 @@ const pool = new Pool({
   user: process.env.DB_USER,
   password: process.env.DB_PASSWORD,
 
-  max: 20,                    
-  min: 2,                     
-
-  
-  idleTimeoutMillis: 60000,   
-  connectionTimeoutMillis: 10000, 
-
-
-  query_timeout: 60000,       
-  statement_timeout: 60000,   
-
-  
-  allowExitOnIdle: true,     
-
  
-  keepAlive: true,            
-  keepAliveInitialDelayMillis: 0,
-
- 
-  ssl: false
 });
+
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 
 
 app.get('/api/geofences/for-serial', async (req, res) => {
