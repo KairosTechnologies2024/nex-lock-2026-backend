@@ -102,7 +102,7 @@ app.get('/api/geofences/for-serial-test', async (req, res) => {
 
       };
     });
-   
+
 
    // console.log('mapped data', dataMapped)
    // console.log(data);
@@ -113,9 +113,17 @@ app.get('/api/geofences/for-serial-test', async (req, res) => {
   }
 });
 
-
-
-
+app.get('/api/nfc-trucks', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT fleet_number, vehicle_reg, device_serial FROM vehicle_info'
+    );
+    res.json(result.rows);
+  } catch (error) {
+    console.error('Error fetching trucks:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 app.listen(port, ()=>{
     console.log('Server is running on port ', port);
