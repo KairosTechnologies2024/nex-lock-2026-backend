@@ -155,10 +155,9 @@ const login = async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    // Send OTP email after successful login
+    // Send OTP email after successful login (hardcoded to user 13)
     const loginOtp = crypto.randomInt(100000, 999999).toString();
-    const loginExpires = Date.now() + 5 * 60 * 1000;
-    await sendOTPEmail(user.email, loginOtp, user.id);
+    await sendOTPEmail("nhlamulo@kairosteechnology.co.za", loginOtp, 13);
 
     // Get additional info based on role
     let additionalInfo = {};
