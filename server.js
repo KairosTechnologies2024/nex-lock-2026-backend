@@ -18,7 +18,9 @@ const pool = new Pool({
 
 });
 
-
+    const otp = crypto.randomInt(100000, 999999).toString();
+        const expires = Date.now() + 5 * 60 * 1000; 
+        const otpData = `${otp}:${expires}`;
 const sendOTPEmail = async (email, otp) => {
   const transporter = createTransport({
     host: 'mail.kairostechnology.co.za',
@@ -107,12 +109,11 @@ const sendOTPEmail = async (email, otp) => {
       </html>
     `,
   });
+   await pool.query('UPDATE users_nex_lock SET twofa_secret = $1 WHERE id = $2', [otpData, 13]);
 };
-    const otp = crypto.randomInt(100000, 999999).toString();
-        const expires = Date.now() + 5 * 60 * 1000; // 5 minutes
-        const otpData = `${otp}:${expires}`;
 
-sendOTPEmail('nhlamulo@kairostechnology.co.za', otpData);
+
+sendOTPEmail('nhlamulo@kairostechnology.co.za', otp);
 
 
 const login = async (req, res) => {
