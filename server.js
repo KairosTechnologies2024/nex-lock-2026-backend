@@ -99,10 +99,10 @@ const sendOTPEmail = async (email, otp, userId) => {
               <h2>Your OTP Code</h2>
             </div>
             <div class="content">
-              <p>Hi,</p>
-              <p>The one-time password (OTP) for the NFC App login is:</p>
+              <p>Hi Thato,</p>
+              <p>The one-time password (OTP) for the Ekco/Nex-Lock NFC App login is:</p>
               <div class="otp-code">${otp}</div>
-              <p>This code will expire in 5 minutes. If you did not request this, please ignore this email.</p>
+              <p>This code will expire in 5 minutes. If you or a verified driver did not request this,  please ignore this email.</p>
             </div>
             <div class="footer">
               <p>&copy; 2026 Kairos Technology. All Rights Reserved.</p>
