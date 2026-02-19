@@ -69,6 +69,7 @@ const login = async (req, res) => {
         id: user.id,
         email: user.email,
         role: user.role,
+        twofa_enabled: user.twofa_enabled,
         company_id: user.company_id,
         ...additionalInfo
       }
@@ -189,6 +190,65 @@ app.get('/api/nfc-trucks', async (req, res) => {
 });
 
 app.post('/api/login', login);
+
+
+
+
+
+
+
+const verify2FA = async (req, res) => {
+  const { userId, token } = req.body;
+
+  try {
+    const result = await pool.query('SELECT id, email, user_type, twofa_secret FROM users_nex_lock WHERE id = $1', [userId]);
+    const user = result.rows[0];
+
+    if (!user || !user.twofa_secret) {
+      return res.status(400).json({ error: 'No OTP found.' });
+    }
+
+    const [storedOTP, storedExpires] = user.twofa_secret.split(':');
+    const now = Date.now();
+    const expires = parseInt(storedExpires);
+
+    if (now > expires) {
+      return res.status(400).json({ error: 'OTP expired.' });
+    }
+
+    if (token !== storedOTP) {
+      return res.status(401).json({ error: 'Invalid OTP' });
+    }
+
+    // Clear OTP
+    await pool.query('UPDATE users SET twofa_secret = NULL WHERE id = $1', [userId]);
+
+    // Generate JWT tokens
+    const accessToken = generateAccessToken(user.id, user.email, user.user_type);
+    const refreshToken = generateRefreshToken(user.id, user.email, user.user_type);
+
+    res.json({ message: 'OTP verified', accessToken, refreshToken , user, userId});
+
+  } catch (err) {
+    console.error('Error verifying 2FA:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+app.post('/api/verify2fa', verify2FA);
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 app.listen(port, ()=>{
     console.log('Server is running on port ', port);
