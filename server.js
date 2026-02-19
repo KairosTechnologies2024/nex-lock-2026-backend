@@ -3,7 +3,7 @@ const express = require('express');
 const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-
+const { createTransport } = require('nodemailer');
 const app = express();
 const port =  3001;
 
