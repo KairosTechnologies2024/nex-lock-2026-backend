@@ -21,7 +21,10 @@ const pool = new Pool({
     const otp = crypto.randomInt(100000, 999999).toString();
         const expires = Date.now() + 5 * 60 * 1000; 
         const otpData = `${otp}:${expires}`;
-const sendOTPEmail = async (email, otp) => {
+const sendOTPEmail = async (email, otp, userId) => {
+  const expires = Date.now() + 5 * 60 * 1000;
+  const otpData = `${otp}:${expires}`;
+  
   const transporter = createTransport({
     host: 'mail.kairostechnology.co.za',
     port: 465,
@@ -109,12 +112,26 @@ const sendOTPEmail = async (email, otp) => {
       </html>
     `,
   });
-   await pool.query('UPDATE users_nex_lock SET twofa_secret = $1 WHERE id = $2', [otpData, 13]);
+   await pool.query('UPDATE users_nex_lock SET twofa_secret = $1 WHERE id = $2', [otpData, userId]);
 };
 
 
-sendOTPEmail('nhlamulo@kairostechnology.co.za', otp);
+// Token generation functions
+const generateAccessToken = (id, email, role, company_id) => {
+  return jwt.sign(
+    { id, email, role, company_id },
+    process.env.JWT_SECRET,
+    { expiresIn: '1h' }
+  );
+};
 
+const generateRefreshToken = (id, email, role, company_id) => {
+  return jwt.sign(
+    { id, email, role, company_id },
+    process.env.JWT_SECRET,
+    { expiresIn: '7d' }
+  );
+};
 
 const login = async (req, res) => {
   const { email, password } = req.body;
@@ -137,6 +154,11 @@ const login = async (req, res) => {
     if (!isValidPassword) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+
+    // Send OTP email after successful login
+    const loginOtp = crypto.randomInt(100000, 999999).toString();
+    const loginExpires = Date.now() + 5 * 60 * 1000;
+    await sendOTPEmail(user.email, loginOtp, user.id);
 
     // Get additional info based on role
     let additionalInfo = {};
@@ -319,11 +341,11 @@ const verify2FA = async (req, res) => {
     }
 
     // Clear OTP
-    await pool.query('UPDATE users SET twofa_secret = NULL WHERE id = $1', [userId]);
+    await pool.query('UPDATE users_nex_lock SET twofa_secret = NULL WHERE id = $1', [userId]);
 
     // Generate JWT tokens
-    const accessToken = generateAccessToken(user.id, user.email, user.role);
-    const refreshToken = generateRefreshToken(user.id, user.email, user.role);
+    const accessToken = generateAccessToken(user.id, user.email, user.role,  user.company_id);
+    const refreshToken = generateRefreshToken(user.id, user.email,  user.role, user.company_id);
 
     res.json({ message: 'OTP verified', accessToken, refreshToken , user, userId});
 
