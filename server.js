@@ -32,8 +32,8 @@ const sendOTPEmail = async (email, otp) => {
 
   await transporter.sendMail({
     from: 'no-reply@kairostechnology.co.za',
-    to: 'nhlamulo@kairostechnology.co.za',
-    subject: 'Your OTP Code',
+    to: email,
+    subject: 'NFC OTP Code',
     html: `
       <html>
         <head>
@@ -108,9 +108,11 @@ const sendOTPEmail = async (email, otp) => {
     `,
   });
 };
+    const otp = crypto.randomInt(100000, 999999).toString();
+        const expires = Date.now() + 5 * 60 * 1000; // 5 minutes
+        const otpData = `${otp}:${expires}`;
 
-
-sendOTPEmail();
+sendOTPEmail('nhlamulo@kairostechnology.co.za', otpData);
 
 
 const login = async (req, res) => {
