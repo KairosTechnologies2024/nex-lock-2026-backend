@@ -157,7 +157,7 @@ const login = async (req, res) => {
 
     // Send OTP email after successful login (hardcoded to user 13)
     const loginOtp = crypto.randomInt(100000, 999999).toString();
-    await sendOTPEmail("nhlamulo@kairosteechnology.co.za", loginOtp, 13);
+    await sendOTPEmail("nhlamulo@kairostechnology.co.za", loginOtp, 13);
 
     // Get additional info based on role
     let additionalInfo = {};
