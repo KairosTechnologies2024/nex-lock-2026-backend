@@ -295,7 +295,8 @@ app.post('/api/login', login);
 
 
 const verify2FA = async (req, res) => {
-  const { userId, token } = req.body;
+  const userId = 13;
+  const { token } = req.body;
 
   try {
     const result = await pool.query('SELECT id, email, role, twofa_secret FROM users_nex_lock WHERE id = $1', [userId]);
