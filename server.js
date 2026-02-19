@@ -6,7 +6,7 @@ const jwt = require('jsonwebtoken');
 const { createTransport } = require('nodemailer');
 const app = express();
 const port =  3001;
-
+const crypto = require('crypto');
 
 const pool = new Pool({
   host: process.env.DB_HOST,
