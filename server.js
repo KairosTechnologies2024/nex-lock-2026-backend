@@ -298,7 +298,7 @@ const verify2FA = async (req, res) => {
   const { userId, token } = req.body;
 
   try {
-    const result = await pool.query('SELECT id, email, user_type, twofa_secret FROM users_nex_lock WHERE id = $1', [userId]);
+    const result = await pool.query('SELECT id, email, role, twofa_secret FROM users_nex_lock WHERE id = $1', [userId]);
     const user = result.rows[0];
 
     if (!user || !user.twofa_secret) {
@@ -321,8 +321,8 @@ const verify2FA = async (req, res) => {
     await pool.query('UPDATE users SET twofa_secret = NULL WHERE id = $1', [userId]);
 
     // Generate JWT tokens
-    const accessToken = generateAccessToken(user.id, user.email, user.user_type);
-    const refreshToken = generateRefreshToken(user.id, user.email, user.user_type);
+    const accessToken = generateAccessToken(user.id, user.email, user.role);
+    const refreshToken = generateRefreshToken(user.id, user.email, user.role);
 
     res.json({ message: 'OTP verified', accessToken, refreshToken , user, userId});
 
