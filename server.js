@@ -363,11 +363,11 @@ app.post('/api/nfc-logs', async (req, res) => {
   const { company, log, truck } = req.body;
 
   // Validate required fields
-  if (!company || !log || !truck) {
+  /* if (!company || !log || !truck) {
     return res.status(400).json({ 
       error: 'Missing required fields: company, log, and truck are all required' 
     });
-  }
+  } */
 
   try {
     // Insert new log entry into nfc_logs table
