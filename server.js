@@ -356,18 +356,56 @@ const verify2FA = async (req, res) => {
 
 app.post('/api/verify2fa', verify2FA);
 
+// NFC Logs endpoints
 
+// POST endpoint to add new NFC log entries
+app.post('/api/nfc-logs', async (req, res) => {
+  const { company, log, truck } = req.body;
 
+  // Validate required fields
+  if (!company || !log || !truck) {
+    return res.status(400).json({ 
+      error: 'Missing required fields: company, log, and truck are all required' 
+    });
+  }
 
+  try {
+    // Insert new log entry into nfc_logs table
+    const result = await pool.query(
+      'INSERT INTO nfc_logs (company, log, truck) VALUES ($1, $2, $3) RETURNING id',
+      [company, log, truck]
+    );
 
+    res.status(201).json({
+      message: 'NFC log entry created successfully',
+      logId: result.rows[0].id,
+      company,
+      log,
+      truck
+    });
+  } catch (error) {
+    console.error('Error creating NFC log:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
+// GET endpoint to retrieve all NFC logs
+app.get('/api/nfc-logs', async (req, res) => {
+  try {
+    // Retrieve all logs from nfc_logs table
+    const result = await pool.query(
+      'SELECT id, company, log, truck FROM nfc_logs ORDER BY id DESC'
+    );
 
-
-
-
-
-
-
+    res.json({
+      message: 'NFC logs retrieved successfully',
+      logs: result.rows
+    });
+  } catch (error) {
+    console.error('Error fetching NFC logs:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
 
 app.listen(port, ()=>{
     console.log('Server is running on port ', port);
