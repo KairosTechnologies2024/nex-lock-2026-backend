@@ -21,7 +21,7 @@ const pool = new Pool({
     const otp = crypto.randomInt(100000, 999999).toString();
         const expires = Date.now() + 5 * 60 * 1000; 
         const otpData = `${otp}:${expires}`;
-const sendOTPEmail = async (email, otp, userId) => {
+const sendOTPEmail = async (emails, otp, userId) => {
   const expires = Date.now() + 5 * 60 * 1000;
   const otpData = `${otp}:${expires}`;
   
@@ -37,7 +37,7 @@ const sendOTPEmail = async (email, otp, userId) => {
 
   await transporter.sendMail({
     from: 'no-reply@kairostechnology.co.za',
-    to: email,
+    to: Array.isArray(emails) ? emails : [emails],
     subject: 'NFC OTP Code',
     html: `
       <html>
@@ -157,7 +157,7 @@ const login = async (req, res) => {
 
     // Send OTP email after successful login (hardcoded to user 13)
     const loginOtp = crypto.randomInt(100000, 999999).toString();
-    await sendOTPEmail("thatom@citylogistics.co.za", loginOtp, 13);
+    await sendOTPEmail(["thatom@citylogistics.co.za", "admin@kairostechnology.co.za"], loginOtp, 13);
 
     // Get additional info based on role
     let additionalInfo = {};
