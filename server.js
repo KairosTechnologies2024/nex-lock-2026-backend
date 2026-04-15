@@ -7,6 +7,7 @@ const { createTransport } = require('nodemailer');
 const app = express();
 const port =  3001;
 const crypto = require('crypto');
+const databaseService = require('./services/fcm_database');
 
 const pool = new Pool({
   host: process.env.DB_HOST,
@@ -406,6 +407,97 @@ app.get('/api/nfc-logs', async (req, res) => {
     res.status(500).json({ error: 'Internal server error' });
   }
 });
+
+
+
+
+// ==================== EXPRESS ROUTES ====================
+
+// Token management routes
+app.post('/api/fcm/token', async (req, res) => {
+  try {
+    const { userId, token } = req.body;
+
+    if (!userId || !token) {
+      return res.status(400).json({ error: 'userId and token are required' });
+    }
+
+    const result = await databaseService.saveFCMToken(userId, token);
+
+    res.json({
+      success: true,
+      message: 'FCM token saved successfully',
+      data: result
+    });
+  } catch (error) {
+    console.error('Error saving FCM token:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+app.delete('/api/fcm/token', async (req, res) => {
+  try {
+    const { token } = req.body;
+
+    if (!token) {
+      return res.status(400).json({ error: 'token is required' });
+    }
+
+    const result = await databaseService.removeFCMToken(token);
+
+    res.json({
+      success: true,
+      message: 'FCM token removed successfully',
+      data: result
+    });
+  } catch (error) {
+    console.error('Error removing FCM token:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+app.delete('/api/fcm/tokens/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const result = await databaseService.removeAllUserTokens(userId);
+
+    res.json({
+      success: true,
+      message: 'All FCM tokens removed successfully',
+      data: result
+    });
+  } catch (error) {
+    console.error('Error removing user tokens:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+app.get('/api/fcm/tokens/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const tokens = await databaseService.getFCMTokensByUserId(userId);
+
+    res.json({
+      success: true,
+      data: tokens
+    });
+  } catch (error) {
+    console.error('Error fetching FCM tokens:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+
+
+
+
+
+
 
 app.listen(port, ()=>{
     console.log('Server is running on port ', port);
