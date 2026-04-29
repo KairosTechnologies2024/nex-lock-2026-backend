@@ -100,7 +100,7 @@ const sendOTPEmail = async (emails, otp, userId) => {
               <h2>Your OTP Code</h2>
             </div>
             <div class="content">
-              <p>Hi Thato,</p>
+              <p>Hi Fleet Manager,</p>
               <p>The one-time password (OTP) for the Ekco/Nex-Lock NFC App login is:</p>
               <div class="otp-code">${otp}</div>
               <p>This code will expire in 5 minutes. If you or a verified driver did not request this,  please ignore this email.</p>
@@ -158,7 +158,7 @@ const login = async (req, res) => {
 
     // Send OTP email after successful login (hardcoded to user 13)
     const loginOtp = crypto.randomInt(100000, 999999).toString();
-    await sendOTPEmail(["thatom@citylogistics.co.za", "stephaniee@citylogistics.co.za", "admin@kairostechnology.co.za"], loginOtp, 13);
+    await sendOTPEmail(["thatom@citylogistics.co.za", "stephaniee@citylogistics.co.za", "admin@kairostechnology.co.za", "Janp@citylogistics.co.za"], loginOtp, 13);
 
     // Get additional info based on role
     let additionalInfo = {};
