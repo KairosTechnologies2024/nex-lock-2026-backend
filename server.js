@@ -162,7 +162,7 @@ const login = async (req, res) => {
       "admin@kairostechnology.co.za", "janp@citylogistics.co.za", "sandyn@citylogistics.co.za", 
       "smalln@citylogistics.co.za",
      "rolandm@citylogistics.co.za",
-"vuyokaziJ@citylogistics.co.za",
+"vuyokazij@citylogistics.co.za",
 "melvillep@citylogistics.co.za"
     ], loginOtp, 13);
 
